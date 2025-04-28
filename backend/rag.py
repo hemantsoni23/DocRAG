@@ -5,7 +5,7 @@ import logging
 import uuid
 from datetime import datetime
 from dotenv import load_dotenv
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from langchain_google_genai import GoogleGenerativeAI
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
@@ -39,7 +39,8 @@ class CustomRetrievalQAChain(LLMChain):
         return super().invoke(prompt_inputs, run_manager=run_manager)
 
 class SimpleRAGSystem:
-    def __init__(self):
+    def __init__(self, client_email=None):
+        self.client_email = client_email
         self.llm = None
         self.retriever = None
         self.qa_chain = None
@@ -51,9 +52,8 @@ class SimpleRAGSystem:
         self.interactions = []
         
         self.initialize_llm()
-        self.initialize_retriever()
-        self.setup_rag_chain()
-
+        # Retriever will be initialized when needed with client_email
+        
     def initialize_llm(self):
         api_key = os.getenv("GEMINI_KEY")
         if not api_key:
@@ -70,18 +70,30 @@ class SimpleRAGSystem:
         )
         logger.info("LLM initialized.")
 
-    def initialize_retriever(self):
-        vectorstore = get_vectorstore()
+    def initialize_retriever(self, client_email=None):
+        """Initialize retriever for specific client."""
+        # Update client_email if provided
+        if client_email:
+            self.client_email = client_email
+            
+        vectorstore = get_vectorstore(self.client_email)
         if not vectorstore:
-            raise ValueError("Vector store is not initialized.")
+            logger.warning(f"Vector store not initialized for client: {self.client_email}")
+            return False
         
         self.retriever = vectorstore.as_retriever(
             search_type="similarity",
             search_kwargs={"k": 4}
         )
-        logger.info("Retriever initialized.")
+        logger.info(f"Retriever initialized for client: {self.client_email}")
+        return True
 
     def setup_rag_chain(self):
+        """Setup the RAG chain with current retriever."""
+        if not self.retriever:
+            logger.warning("Cannot setup RAG chain: Retriever not initialized")
+            return False
+            
         template = """
 You are a helpful AI assistant answering questions based on the given documents and previous conversation.
 If the answer is not found in the provided context, politely state that you don't have enough information.
@@ -108,6 +120,7 @@ ASSISTANT RESPONSE:
             verbose=False
         )
         logger.info("RAG QA chain setup complete.")
+        return True
 
     def _format_chat_history(self, chat_history):
         if isinstance(chat_history, str):
@@ -120,11 +133,31 @@ ASSISTANT RESPONSE:
             for user, assistant in chat_history
         ).strip()
 
-    def get_answer(self, query, chat_history='', stream_callback=None):
-        if not self.qa_chain:
-            self.setup_rag_chain()
+    def get_answer(self, query, chat_history='', stream_callback=None, client_email=None):
+        """Get answer for query, optionally updating the client_email."""
+        # Update client if provided
+        if client_email:
+            if client_email != self.client_email:
+                self.client_email = client_email
+                self.initialize_retriever(client_email)
+                self.setup_rag_chain()
+        
+        # Ensure retriever and chain are initialized for this client
+        if not self.retriever or not self.qa_chain:
+            retriever_initialized = self.initialize_retriever()
+            if not retriever_initialized:
+                return {
+                    "answer": "Please upload documents first.",
+                    "interaction_id": str(uuid.uuid4())
+                }
+            chain_initialized = self.setup_rag_chain()
+            if not chain_initialized:
+                return {
+                    "answer": "Could not initialize the QA system. Please try again.",
+                    "interaction_id": str(uuid.uuid4())
+                }
 
-        logger.info(f"Processing query: {query}")
+        logger.info(f"Processing query for client {self.client_email}: {query}")
         interaction_id = str(uuid.uuid4())
         formatted_history = self._format_chat_history(chat_history)
 
@@ -151,12 +184,13 @@ ASSISTANT RESPONSE:
                 result = self.qa_chain.invoke(inputs)
                 answer = result.get("text", "")
         except Exception as e:
-            logger.error(f"Error during answer retrieval: {e}")
+            logger.error(f"Error during answer retrieval for client {self.client_email}: {e}")
             answer = f"An error occurred: {str(e)}"
 
         self.interactions.append({
             "interaction_id": interaction_id,
             "timestamp": datetime.now().isoformat(),
+            "client_email": self.client_email,
             "query": query,
             "answer": answer,
             "source_docs": [],
@@ -175,6 +209,7 @@ ASSISTANT RESPONSE:
         
         self.feedback_store.append({
             "interaction_id": interaction_id,
+            "client_email": interaction.get("client_email", self.client_email),
             "timestamp": datetime.now().isoformat(),
             "score": score,
             "helpful": helpful
@@ -182,15 +217,30 @@ ASSISTANT RESPONSE:
         logger.info(f"Feedback recorded for interaction {interaction_id}")
         return True
 
-    def get_system_stats(self):
-        total_interactions = len(self.interactions)
-        feedback_entries = len(self.feedback_store)
+    def get_system_stats(self, client_email=None):
+        """Get system stats, optionally filtered by client_email."""
+        if client_email:
+            # Filter interactions and feedback by client
+            client_interactions = [i for i in self.interactions if i.get("client_email") == client_email]
+            client_feedback = [f for f in self.feedback_store if f.get("client_email") == client_email]
+            
+            total_interactions = len(client_interactions)
+            feedback_entries = len(client_feedback)
+        else:
+            # Get stats for all clients
+            total_interactions = len(self.interactions)
+            feedback_entries = len(self.feedback_store)
 
         if feedback_entries == 0:
             return {"feedback_analysis": {"message": "No feedback yet."}}
 
-        helpful_count = sum(1 for f in self.feedback_store if f["helpful"])
-        avg_score = sum(f["score"] for f in self.feedback_store) / feedback_entries
+        if client_email:
+            helpful_count = sum(1 for f in client_feedback if f["helpful"])
+            avg_score = sum(f["score"] for f in client_feedback) / feedback_entries
+        else:
+            helpful_count = sum(1 for f in self.feedback_store if f["helpful"])
+            avg_score = sum(f["score"] for f in self.feedback_store) / feedback_entries
+            
         helpful_percentage = (helpful_count / feedback_entries) * 100
 
         return {
@@ -202,14 +252,20 @@ ASSISTANT RESPONSE:
             }
         }
 
-# Singleton RAG system (thread-safe lazy init)
-_rag_system = None
+# Dictionary to store client-specific RAG systems
+_rag_systems = {}
 _rag_lock = Lock()
 
-def get_rag_system():
-    global _rag_system
-    if _rag_system is None:
+def get_rag_system(client_email=None):
+    """Get a RAG system for the specified client (or create if it does not exist)."""
+    global _rag_systems
+    
+    if client_email is None:
+        client_email = "default"
+        
+    if client_email not in _rag_systems:
         with _rag_lock:
-            if _rag_system is None:  # Double-checked locking
-                _rag_system = SimpleRAGSystem()
-    return _rag_system
+            if client_email not in _rag_systems:  # Double-checked locking
+                _rag_systems[client_email] = SimpleRAGSystem(client_email)
+    
+    return _rag_systems[client_email]

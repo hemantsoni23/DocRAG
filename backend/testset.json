@@ -1,0 +1,10 @@
+[
+    {
+        "query": "What is LangChain?",
+        "ideal_answer": "LangChain is a framework for building applications powered by LLMs."
+    },
+    {
+        "query": "Who founded OpenAI?",
+        "ideal_answer": "OpenAI was founded by Elon Musk, Sam Altman, Greg Brockman, and others."
+    }
+]
