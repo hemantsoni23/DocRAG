@@ -1,14 +1,15 @@
 import os
-import logging
+import re
 import uuid
+import logging
 from datetime import datetime
 from dotenv import load_dotenv
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from langchain.schema import Document
-from langchain_google_genai import GoogleGenerativeAI
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
+from langchain_google_genai import GoogleGenerativeAI
 from backend.vectorStore import get_vectorstore
 from threading import Lock
 
@@ -17,25 +18,18 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 class QueryOptimizer:
-    """Optional: Use LLM to rephrase or expand query if retrieval fails."""
     def __init__(self, llm):
         self.llm = llm
 
     def optimize(self, query: str) -> str:
-        prompt = f"""
-        Improve or expand the following search query to retrieve more relevant documents, but keep it faithful:
-        Query: "{query}"
-        Improved Query:
-        """
+        prompt = f"""Improve or expand the following search query to retrieve more relevant documents, but keep it faithful:\nQuery: "{query}"\nImproved Query:"""
         try:
-            optimized = self.llm.invoke(prompt).strip()
-            return optimized
+            return self.llm.invoke(prompt).strip()
         except Exception as e:
             logger.warning(f"Query optimization failed: {e}")
             return query
 
 class ContextCompressor:
-    """Compress context if needed to stay within token limits."""
     def __init__(self, llm, max_tokens=3500):
         self.llm = llm
         self.max_tokens = max_tokens
@@ -46,21 +40,13 @@ class ContextCompressor:
             return combined
         logger.info(f"Context too long ({len(combined.split())} words). Compressing...")
         try:
-            compression_prompt = f"""
-            Summarize the following documents into key points without losing important information:
-
-            {combined}
-
-            Compressed Summary:
-            """
-            summary = self.llm.invoke(compression_prompt).strip()
-            return summary
+            prompt = f"""Summarize the following documents into key points without losing important information:\n\n{combined}\n\nCompressed Summary:"""
+            return self.llm.invoke(prompt).strip()
         except Exception as e:
             logger.error(f"Compression failed: {e}")
             return combined
 
 class AdaptiveRetriever:
-    """Advanced Adaptive Retriever with dynamic k, reranking, fallback, optimization."""
     def __init__(self, retriever, llm):
         self.retriever = retriever
         self.llm = llm
@@ -69,14 +55,9 @@ class AdaptiveRetriever:
 
     def _estimate_complexity(self, query: str) -> int:
         wc = len(query.split())
-        if wc < 5:
-            return 3
-        elif wc < 15:
-            return 6
-        else:
-            return 10
+        return 3 if wc < 5 else 6 if wc < 15 else 10
 
-    def get_documents(self, query: str) -> List[Document]:
+    def get_documents(self, query: str) -> Tuple[List[Document], float]:
         adaptive_k = self._estimate_complexity(query)
         docs = self._try_retrieve(query, k=adaptive_k)
 
@@ -90,9 +71,12 @@ class AdaptiveRetriever:
             docs = self._try_retrieve(improved_query, k=adaptive_k * 2)
 
         if docs:
-            reranked_docs, _ = self._rerank_with_llm(query, docs)
-            return reranked_docs
-        return []
+            compressed_context = self.compressor.compress(docs)
+            if len(docs) <= 3:
+                return docs, 0.7
+            return self._rerank_with_llm(query, docs)
+
+        return [], 0.0
 
     def _try_retrieve(self, query: str, k: int) -> List[Document]:
         try:
@@ -101,32 +85,18 @@ class AdaptiveRetriever:
             logger.error(f"Retriever failed: {e}")
             return []
 
-    def _rerank_with_llm(self, query: str, docs: List[Document]) -> (List[Document], float):
+    def _rerank_with_llm(self, query: str, docs: List[Document]) -> Tuple[List[Document], float]:
         context = "\n\n".join([f"Doc {i+1}: {doc.page_content}" for i, doc in enumerate(docs)])
-        rerank_prompt = f"""
-        You are an expert AI evaluator.
-        Given the user query: "{query}"
-        and these documents:
-
-        {context}
-
-        Rank documents by relevance, output document numbers separated by commas. Also, rate overall document relevance to the query on a 0-1 scale (1=perfect).
-        Example Output:
-        "Ranking: 3,1,2
-        Relevance Score: 0.85"
-        """
-
+        prompt = f"""You are an expert AI evaluator.\nGiven the user query: "{query}"\nand these documents:\n\n{context}\n\nRank documents by relevance, output document numbers separated by commas. Also, rate overall document relevance to the query on a 0-1 scale (1=perfect).\nExample Output:\n"Ranking: 3,1,2\nRelevance Score: 0.85" """
         try:
-            response = self.llm.invoke(rerank_prompt).strip()
+            response = self.llm.invoke(prompt).strip()
             lines = response.splitlines()
             doc_line = next(line for line in lines if line.startswith("Ranking"))
             score_line = next(line for line in lines if line.startswith("Relevance Score"))
 
-            doc_indices = [int(num.strip()) - 1 for num in doc_line.split(":")[1].split(",")]
-            relevance_score = float(score_line.split(":")[1].strip())
-
-            reranked_docs = [docs[i] for i in doc_indices if 0 <= i < len(docs)]
-            return reranked_docs, relevance_score
+            indices = [int(n) - 1 for n in re.findall(r'\d+', doc_line)]
+            score = float(score_line.split(":")[1].strip())
+            return [docs[i] for i in indices if 0 <= i < len(docs)], score
         except Exception as e:
             logger.warning(f"Reranking failed: {e}")
             return docs, 0.5
@@ -134,22 +104,19 @@ class AdaptiveRetriever:
 class CustomRetrievalQAChain(LLMChain):
     retriever: AdaptiveRetriever
 
-    def retrieve_context(self, query: str) -> str:
-        docs = self.retriever.get_documents(query)
-        compressed_context = self.retriever.compressor.compress(docs)
-        return compressed_context
+    def retrieve_context(self, query: str) -> Tuple[str, float]:
+        docs, score = self.retriever.get_documents(query)
+        return self.retriever.compressor.compress(docs), score
 
     def invoke(self, inputs: Dict[str, Any], run_manager=None):
         query = inputs["question"]
         chat_history = inputs.get("chat_history", "")
-        context = self.retrieve_context(query)
-
-        prompt_inputs = {
+        context, _ = self.retrieve_context(query)
+        return super().invoke({
             "context": context,
             "question": query,
             "chat_history": chat_history,
-        }
-        return super().invoke(prompt_inputs, run_manager=run_manager)
+        }, run_manager=run_manager)
 
 class SimpleRAGSystem:
     def __init__(self, client_email=None):
@@ -157,10 +124,7 @@ class SimpleRAGSystem:
         self.llm = None
         self.retriever = None
         self.qa_chain = None
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
+        self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
         self.feedback_store = []
         self.interactions = []
         self.initialize_llm()
@@ -198,23 +162,20 @@ class SimpleRAGSystem:
         if not self.retriever:
             logger.warning("Retriever missing.")
             return False
-        template = """
-        You are a helpful AI assistant using retrieved documents and prior conversation.
-        Answer strictly based on context. If unsure, say "I don't know."
-
-        CHAT HISTORY:
-        {chat_history}
-
-        DOCUMENT CONTEXT:
-        {context}
-
-        USER QUESTION:
-        {question}
-
-        ASSISTANT RESPONSE:
-        """
         prompt = PromptTemplate(
-            template=template.strip(),
+            template="""
+            You are a concise and accurate AI assistant. Use the context and chat history to answer the user's question.
+            Chat History:
+            {chat_history}
+
+            Relevant Context:
+            {context}
+
+            Question:
+            {question}
+
+            Answer:
+            """.strip(),
             input_variables=["context", "question", "chat_history"]
         )
         self.qa_chain = CustomRetrievalQAChain(
@@ -230,11 +191,19 @@ class SimpleRAGSystem:
         if isinstance(chat_history, str):
             return chat_history
         return "\n\n".join(
-            f"Human: {user}\nAssistant: {assistant or ''}"
-            for user, assistant in chat_history
+            f"Human: {user}\nAssistant: {assistant or ''}" for user, assistant in chat_history
         ).strip()
 
-    def get_answer(self, query, chat_history='', stream_callback=None, client_email=None):
+    def _clean_response(self, response: str) -> str:
+        blacklist = [
+            "Based on the document", "According to the context", "From the documents",
+            "Based on the context,", "Based on the information provided"
+        ]
+        for phrase in blacklist:
+            response = response.replace(phrase, "")
+        return response.strip()
+
+    def get_answer(self, query: str, chat_history: str | List[tuple[str, str]] = '', stream_callback=None, client_email: Optional[str] = None) -> Dict[str, Any]:
         if client_email and client_email != self.client_email:
             self.client_email = client_email
             self.initialize_retriever(client_email)
@@ -248,21 +217,21 @@ class SimpleRAGSystem:
 
         interaction_id = str(uuid.uuid4())
         formatted_history = self._format_chat_history(chat_history)
-
-        inputs = {
-            "question": query,
-            "chat_history": formatted_history,
-        }
-
+        inputs = {"question": query, "chat_history": formatted_history}
         answer = ""
+        relevance_score = 0.0
+        warning_msg = ""
+
         try:
+            context, relevance_score = self.qa_chain.retrieve_context(query)
+
+            if relevance_score < 0.4:
+                warning_msg = "⚠️ I'm not confident in the available information. The documents may be unrelated."
+            elif relevance_score < 0.7:
+                warning_msg = "Note: The retrieved context might only be partially relevant."
+
             if stream_callback:
-                context = self.qa_chain.retrieve_context(query)
-                prompt_text = self.qa_chain.prompt.format(
-                    context=context,
-                    question=query,
-                    chat_history=formatted_history
-                )
+                prompt_text = self.qa_chain.prompt.format(context=context, question=query, chat_history=formatted_history)
                 for chunk in self.llm.stream(prompt_text):
                     if hasattr(chunk, 'text'):
                         token = chunk.text
@@ -270,9 +239,14 @@ class SimpleRAGSystem:
                         stream_callback(token)
             else:
                 result = self.qa_chain.invoke(inputs)
-                answer = result.get("text", "")
+                raw_answer = result.get("text", "")
+                answer = self._clean_response(raw_answer)
+
+            if warning_msg:
+                answer = f"{warning_msg}\n\n{answer}"
+
         except Exception as e:
-            logger.error(f"QA failure: {e}")
+            logger.error(f"QA failure for client '{self.client_email}': {e}")
             answer = f"An error occurred: {str(e)}"
 
         self.interactions.append({
@@ -281,13 +255,15 @@ class SimpleRAGSystem:
             "client_email": self.client_email,
             "query": query,
             "answer": answer,
-            "source_docs": [],
+            "source_docs": [], 
+            "relevance_score": relevance_score,
         })
 
         return {
             "answer": answer,
             "interaction_id": interaction_id
         }
+
 
     def add_feedback(self, interaction_id, score, helpful):
         interaction = next((i for i in self.interactions if i["interaction_id"] == interaction_id), None)
@@ -305,19 +281,14 @@ class SimpleRAGSystem:
         return True
 
     def get_system_stats(self, client_email=None):
-        if client_email:
-            inters = [i for i in self.interactions if i.get("client_email") == client_email]
-            feeds = [f for f in self.feedback_store if f.get("client_email") == client_email]
-        else:
-            inters = self.interactions
-            feeds = self.feedback_store
+        inters = [i for i in self.interactions if i.get("client_email") == client_email] if client_email else self.interactions
+        feeds = [f for f in self.feedback_store if f.get("client_email") == client_email] if client_email else self.feedback_store
 
         if not feeds:
             return {"feedback_analysis": {"message": "No feedback yet."}}
 
-        helpful_count = sum(1 for f in feeds if f["helpful"])
+        helpful_pct = (sum(1 for f in feeds if f["helpful"]) / len(feeds)) * 100
         avg_score = sum(f["score"] for f in feeds) / len(feeds)
-        helpful_pct = (helpful_count / len(feeds)) * 100
 
         return {
             "feedback_analysis": {
@@ -328,15 +299,14 @@ class SimpleRAGSystem:
             }
         }
 
+# Global RAG system cache
 _rag_systems = {}
 _rag_lock = Lock()
 
 def get_rag_system(client_email=None):
     global _rag_systems
-    if client_email is None:
-        client_email = "default"
-    if client_email not in _rag_systems:
-        with _rag_lock:
-            if client_email not in _rag_systems:
-                _rag_systems[client_email] = SimpleRAGSystem(client_email)
+    client_email = client_email or "default"
+    with _rag_lock:
+        if client_email not in _rag_systems:
+            _rag_systems[client_email] = SimpleRAGSystem(client_email)
     return _rag_systems[client_email]

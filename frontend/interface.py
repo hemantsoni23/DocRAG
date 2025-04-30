@@ -264,4 +264,4 @@ def create_demo():
 
 if __name__ == "__main__":
     demo = create_demo()
-    demo.launch(share=False)
+    demo.launch(share=False, pwa=True)
