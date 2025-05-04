@@ -1,3 +1,4 @@
+#backend/rag.py
 import os
 import re
 import uuid
@@ -12,6 +13,7 @@ from langchain.memory import ConversationBufferMemory
 from langchain_google_genai import GoogleGenerativeAI
 from backend.vectorStore import get_vectorstore
 from threading import Lock
+from functools import lru_cache
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -53,30 +55,19 @@ class AdaptiveRetriever:
         self.optimizer = QueryOptimizer(llm)
         self.compressor = ContextCompressor(llm)
 
-    def _estimate_complexity(self, query: str) -> int:
-        wc = len(query.split())
-        return 3 if wc < 5 else 6 if wc < 15 else 10
-
+    @lru_cache(maxsize=128)
     def get_documents(self, query: str) -> Tuple[List[Document], float]:
-        adaptive_k = self._estimate_complexity(query)
-        docs = self._try_retrieve(query, k=adaptive_k)
+        docs = self._try_retrieve(query, k=4)
 
         if not docs:
-            logger.warning("Retrying retrieval with larger k.")
-            docs = self._try_retrieve(query, k=adaptive_k * 2)
-
-        if not docs:
-            logger.warning("Retrying retrieval with query optimization.")
             improved_query = self.optimizer.optimize(query)
-            docs = self._try_retrieve(improved_query, k=adaptive_k * 2)
+            docs = self._try_retrieve(improved_query, k=6)
 
-        if docs:
-            compressed_context = self.compressor.compress(docs)
-            if len(docs) <= 3:
-                return docs, 0.7
-            return self._rerank_with_llm(query, docs)
+        if not docs:
+            return [], 0.0
 
-        return [], 0.0
+        score = self._estimate_relevance_score(query, self._combine_documents(docs))
+        return docs, score
 
     def _try_retrieve(self, query: str, k: int) -> List[Document]:
         try:
@@ -84,6 +75,16 @@ class AdaptiveRetriever:
         except Exception as e:
             logger.error(f"Retriever failed: {e}")
             return []
+
+    def _combine_documents(self, docs: List[Document]) -> str:
+        return "\n\n".join(doc.page_content.strip() for doc in docs)
+
+    def _estimate_relevance_score(self, query: str, context: str) -> float:
+        query_words = set(query.lower().split())
+        context_words = set(context.lower().split())
+        common = query_words & context_words
+        score = len(common) / max(len(query_words), 1)
+        return min(max(score, 0.2), 1.0)
 
     def _rerank_with_llm(self, query: str, docs: List[Document]) -> Tuple[List[Document], float]:
         context = "\n\n".join([f"Doc {i+1}: {doc.page_content}" for i, doc in enumerate(docs)])
@@ -106,7 +107,8 @@ class CustomRetrievalQAChain(LLMChain):
 
     def retrieve_context(self, query: str) -> Tuple[str, float]:
         docs, score = self.retriever.get_documents(query)
-        return self.retriever.compressor.compress(docs), score
+        compressed_context = self.retriever.compressor.compress(docs)
+        return compressed_context, score
 
     def invoke(self, inputs: Dict[str, Any], run_manager=None):
         query = inputs["question"]
@@ -119,8 +121,9 @@ class CustomRetrievalQAChain(LLMChain):
         }, run_manager=run_manager)
 
 class SimpleRAGSystem:
-    def __init__(self, client_email=None):
+    def __init__(self, client_email=None, chatbot_id="default"):
         self.client_email = client_email
+        self.chatbot_id = chatbot_id
         self.llm = None
         self.retriever = None
         self.qa_chain = None
@@ -144,18 +147,21 @@ class SimpleRAGSystem:
         )
         logger.info("LLM initialized.")
 
-    def initialize_retriever(self, client_email=None):
+    def initialize_retriever(self, client_email=None, chatbot_id=None):
         if client_email:
             self.client_email = client_email
-        vectorstore = get_vectorstore(self.client_email)
+        if chatbot_id:
+            self.chatbot_id = chatbot_id
+            
+        vectorstore = get_vectorstore(self.client_email, self.chatbot_id)
         if not vectorstore:
-            logger.warning(f"No vectorstore for {self.client_email}")
+            logger.warning(f"No vectorstore for {self.client_email}, chatbot {self.chatbot_id}")
             return False
         self.retriever = AdaptiveRetriever(
             retriever=vectorstore.as_retriever(search_type="similarity"),
             llm=self.llm
         )
-        logger.info(f"Retriever ready for {self.client_email}")
+        logger.info(f"Retriever ready for {self.client_email}, chatbot {self.chatbot_id}")
         return True
 
     def setup_rag_chain(self):
@@ -203,15 +209,19 @@ class SimpleRAGSystem:
             response = response.replace(phrase, "")
         return response.strip()
 
-    def get_answer(self, query: str, chat_history: str | List[tuple[str, str]] = '', stream_callback=None, client_email: Optional[str] = None) -> Dict[str, Any]:
-        if client_email and client_email != self.client_email:
-            self.client_email = client_email
-            self.initialize_retriever(client_email)
+    def get_answer(self, query: str, chat_history: str | List[tuple[str, str]] = '', stream_callback=None, client_email: Optional[str] = None, chatbot_id: Optional[str] = None) -> Dict[str, Any]:
+        client_changed = client_email and client_email != self.client_email
+        chatbot_changed = chatbot_id and chatbot_id != self.chatbot_id
+        
+        if client_changed or chatbot_changed:
+            self.client_email = client_email or self.client_email
+            self.chatbot_id = chatbot_id or self.chatbot_id
+            self.initialize_retriever(self.client_email, self.chatbot_id)
             self.setup_rag_chain()
 
         if not self.retriever or not self.qa_chain:
             if not self.initialize_retriever():
-                return {"answer": "Please upload documents first.", "interaction_id": str(uuid.uuid4())}
+                return {"answer": f"Please upload documents for chatbot '{self.chatbot_id}'.", "interaction_id": str(uuid.uuid4())}
             if not self.setup_rag_chain():
                 return {"answer": "Could not initialize QA.", "interaction_id": str(uuid.uuid4())}
 
@@ -225,10 +235,10 @@ class SimpleRAGSystem:
         try:
             context, relevance_score = self.qa_chain.retrieve_context(query)
 
-            if relevance_score < 0.4:
-                warning_msg = "⚠️ I'm not confident in the available information. The documents may be unrelated."
-            elif relevance_score < 0.7:
-                warning_msg = "Note: The retrieved context might only be partially relevant."
+            if relevance_score < 0.3:
+                warning_msg = "⚠️ I'm not confident in the available information."
+            else:
+                warning_msg = ""
 
             if stream_callback:
                 prompt_text = self.qa_chain.prompt.format(context=context, question=query, chat_history=formatted_history)
@@ -246,13 +256,14 @@ class SimpleRAGSystem:
                 answer = f"{warning_msg}\n\n{answer}"
 
         except Exception as e:
-            logger.error(f"QA failure for client '{self.client_email}': {e}")
+            logger.error(f"QA failure for client '{self.client_email}', chatbot '{self.chatbot_id}': {e}")
             answer = f"An error occurred: {str(e)}"
 
         self.interactions.append({
             "interaction_id": interaction_id,
             "timestamp": datetime.now().isoformat(),
             "client_email": self.client_email,
+            "chatbot_id": self.chatbot_id,
             "query": query,
             "answer": answer,
             "source_docs": [], 
@@ -273,6 +284,7 @@ class SimpleRAGSystem:
         self.feedback_store.append({
             "interaction_id": interaction_id,
             "client_email": interaction.get("client_email", self.client_email),
+            "chatbot_id": interaction.get("chatbot_id", self.chatbot_id),
             "timestamp": datetime.now().isoformat(),
             "score": score,
             "helpful": helpful
@@ -280,12 +292,24 @@ class SimpleRAGSystem:
         logger.info(f"Feedback for {interaction_id} stored.")
         return True
 
-    def get_system_stats(self, client_email=None):
-        inters = [i for i in self.interactions if i.get("client_email") == client_email] if client_email else self.interactions
-        feeds = [f for f in self.feedback_store if f.get("client_email") == client_email] if client_email else self.feedback_store
+    def get_system_stats(self, client_email=None, chatbot_id=None):
+        if client_email:
+            if chatbot_id:
+                # Stats for specific chatbot
+                inters = [i for i in self.interactions if i.get("client_email") == client_email and i.get("chatbot_id") == chatbot_id]
+                feeds = [f for f in self.feedback_store if f.get("client_email") == client_email and f.get("chatbot_id") == chatbot_id]
+            else:
+                # Stats for all client's chatbots
+                inters = [i for i in self.interactions if i.get("client_email") == client_email]
+                feeds = [f for f in self.feedback_store if f.get("client_email") == client_email]
+        else:
+            # All stats
+            inters = self.interactions
+            feeds = self.feedback_store
 
         if not feeds:
-            return {"feedback_analysis": {"message": "No feedback yet."}}
+            chatbot_info = f" for chatbot '{chatbot_id}'" if chatbot_id else ""
+            return {"feedback_analysis": {"message": f"No feedback yet{chatbot_info}."}}
 
         helpful_pct = (sum(1 for f in feeds if f["helpful"]) / len(feeds)) * 100
         avg_score = sum(f["score"] for f in feeds) / len(feeds)
@@ -293,20 +317,26 @@ class SimpleRAGSystem:
         return {
             "feedback_analysis": {
                 "total_interactions": len(inters),
-                "feedback_count": len(feeds),
+                "interactions_with_feedback": len(feeds),
                 "helpful_percentage": helpful_pct,
                 "average_score": avg_score,
             }
         }
 
 # Global RAG system cache
+# Structure: {client_email: {chatbot_id: rag_system}}
 _rag_systems = {}
 _rag_lock = Lock()
 
-def get_rag_system(client_email=None):
+def get_rag_system(client_email=None, chatbot_id="default"):
     global _rag_systems
     client_email = client_email or "default"
+    
     with _rag_lock:
         if client_email not in _rag_systems:
-            _rag_systems[client_email] = SimpleRAGSystem(client_email)
-    return _rag_systems[client_email]
+            _rag_systems[client_email] = {}
+        
+        if chatbot_id not in _rag_systems[client_email]:
+            _rag_systems[client_email][chatbot_id] = SimpleRAGSystem(client_email, chatbot_id)
+    
+    return _rag_systems[client_email][chatbot_id]
