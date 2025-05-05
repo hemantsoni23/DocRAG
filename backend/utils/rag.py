@@ -11,7 +11,7 @@ from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
 from langchain_google_genai import GoogleGenerativeAI
-from backend.vectorStore import get_vectorstore
+from utils.vectorStore import get_vectorstore
 from threading import Lock
 from functools import lru_cache
 

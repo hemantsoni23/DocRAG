@@ -4,13 +4,13 @@ import re
 import os
 import uuid
 
-from backend.loader import load_document
-from backend.text_processor import split_documents
-from backend.vectorStore import (
+from backend.utils.loader import load_document
+from backend.utils.text_processor import split_documents
+from backend.utils.vectorStore import (
     create_vectorstore, reset_vectorstore, get_vectorstore,
     list_client_chatbots, update_vectorstore, delete_document, _load_metadata
 )
-from backend.rag import get_rag_system
+from backend.utils.rag import get_rag_system
 
 logger = logging.getLogger(__name__)
 
