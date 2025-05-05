@@ -118,15 +118,12 @@ def add_to_existing_chatbot(files, chatbot_id, email_state):
     all_docs, processed, failed = process_uploaded_files(files)
     if not all_docs:
         return "⚠️ Failed to extract any content.", []
-    print(all_docs)
     all_chunks = []
     for doc in all_docs:
         file_name = doc.metadata.get("source", "unknown_file")
         doc_chunks = split_documents([doc], file_name)
         all_chunks.extend(doc_chunks)
-    print(all_chunks)
     update_vectorstore(all_chunks, client_email, chatbot_id)
-    print("\n \n \n Hello there is am HERE \n \n \n")
     status = f"✅ Added {processed} files to chatbot."
     if failed:
         status += f"\n⚠️ {failed} file(s) failed."
