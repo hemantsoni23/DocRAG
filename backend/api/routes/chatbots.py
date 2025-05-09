@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks
 from typing import List
 from pydantic import EmailStr
-
+from utils.scraper import scrape_website
 from models.schema import ChatbotResponse
 from utils.helpers import validate_email
 from services.file_service import process_files, split_into_chunks
@@ -28,13 +28,27 @@ async def get_chatbots(client_email: EmailStr = Depends(validate_email)):
     except Exception as e:
         logger.error(f"Error fetching chatbots: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching chatbots: {str(e)}")
+    
+@router.get("/get-scraping", response_model=dict)
+async def get_scraping(url: str):
+    """Get the scraped content from a URL."""
+    try:
+        website_text = scrape_website(url)
+        if website_text:
+            return {"status": "success", "content": website_text}
+        else:
+            return {"status": "error", "message": "No extractable content found"}
+    except Exception as e:
+        logger.error(f"Failed to scrape {url}: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to scrape website: {str(e)}")
 
 @router.post("", response_model=dict)
 async def create_chatbot(
     background_tasks: BackgroundTasks,
     name: str = Form(...),
     client_email: EmailStr = Form(...),
-    files: List[UploadFile] = File(...)
+    files: List[UploadFile] = File(...),
+    url: str = Form(None),
 ):
     """Create a new chatbot with uploaded documents."""
     if not files:
@@ -42,13 +56,27 @@ async def create_chatbot(
     
     chatbot_name = name or f"Chatbot {uuid.uuid4().hex[:6]}"
     chatbot_id = f"cb_{uuid.uuid4().hex[:10]}"
-    
-    all_docs, processed, failed, cleanup_func = await process_files(files)
-    background_tasks.add_task(cleanup_func)
-    
-    if not all_docs:
-        raise HTTPException(status_code=400, detail="Failed to extract any content from files")
-    
+
+    all_docs = []
+
+    if url:
+        try:
+            website_text = scrape_website(url)
+            if website_text:
+                all_docs.append({"source": url, "content": website_text})
+            else:
+                logger.warning(f"No extractable content from {url}")
+        except Exception as e:
+            logger.error(f"Failed to scrape {url}: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Failed to scrape website: {str(e)}")
+    else:
+        
+        all_docs, processed, failed, cleanup_func = await process_files(files)
+        background_tasks.add_task(cleanup_func)
+        
+        if not all_docs:
+            raise HTTPException(status_code=400, detail="Failed to extract any content from files")
+        
     all_chunks = split_into_chunks(all_docs)
     create_vectorstore(all_chunks, client_email, chatbot_id, chatbot_name)
     
