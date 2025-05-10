@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Constants
-BASE_CHROMA_PATH = "./backend/vectorstore"
+BASE_CHROMA_PATH = "./vectorstore"
 DEFAULT_COLLECTION_NAME = "rag_docs"
 
 # Thread lock

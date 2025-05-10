@@ -1,4 +1,3 @@
-#backend/rag.py
 import os
 import re
 import uuid
@@ -11,7 +10,7 @@ from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
 from langchain_google_genai import GoogleGenerativeAI
-from backend.utils.vectorStore import get_vectorstore
+from utils.vectorStore import get_vectorstore
 from threading import Lock
 from functools import lru_cache
 
@@ -49,11 +48,12 @@ class ContextCompressor:
             return combined
 
 class AdaptiveRetriever:
-    def __init__(self, retriever, llm):
+    def __init__(self, retriever, llm_main, llm_fast=None):
         self.retriever = retriever
-        self.llm = llm
-        self.optimizer = QueryOptimizer(llm)
-        self.compressor = ContextCompressor(llm)
+        self.llm_main = llm_main
+        self.llm_fast = llm_fast or llm_main
+        self.optimizer = QueryOptimizer(self.llm_fast)  # Use faster model for query optimization
+        self.compressor = ContextCompressor(self.llm_main)  # Keep main model for compression
 
     @lru_cache(maxsize=128)
     def get_documents(self, query: str) -> Tuple[List[Document], float]:
@@ -80,6 +80,7 @@ class AdaptiveRetriever:
         return "\n\n".join(doc.page_content.strip() for doc in docs)
 
     def _estimate_relevance_score(self, query: str, context: str) -> float:
+        # Simple heuristic-based scoring (no LLM needed)
         query_words = set(query.lower().split())
         context_words = set(context.lower().split())
         common = query_words & context_words
@@ -90,7 +91,8 @@ class AdaptiveRetriever:
         context = "\n\n".join([f"Doc {i+1}: {doc.page_content}" for i, doc in enumerate(docs)])
         prompt = f"""You are an expert AI evaluator.\nGiven the user query: "{query}"\nand these documents:\n\n{context}\n\nRank documents by relevance, output document numbers separated by commas. Also, rate overall document relevance to the query on a 0-1 scale (1=perfect).\nExample Output:\n"Ranking: 3,1,2\nRelevance Score: 0.85" """
         try:
-            response = self.llm.invoke(prompt).strip()
+            # Use faster model for reranking
+            response = self.llm_fast.invoke(prompt).strip()
             lines = response.splitlines()
             doc_line = next(line for line in lines if line.startswith("Ranking"))
             score_line = next(line for line in lines if line.startswith("Relevance Score"))
@@ -124,28 +126,47 @@ class SimpleRAGSystem:
     def __init__(self, client_email=None, chatbot_id="default"):
         self.client_email = client_email
         self.chatbot_id = chatbot_id
-        self.llm = None
+        self.llm_main = None
+        self.llm_fast = None
         self.retriever = None
         self.qa_chain = None
         self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
         self.feedback_store = []
         self.interactions = []
-        self.initialize_llm()
+        self.initialize_models()
 
-    def initialize_llm(self):
-        api_key = os.getenv("GEMINI_KEY")
-        if not api_key:
+    def initialize_models(self):
+        # Initialize main (higher-quality) model
+        main_api_key = os.getenv("GEMINI_KEY")
+        if not main_api_key:
             raise ValueError("GEMINI_KEY not found")
-        self.llm = GoogleGenerativeAI(
-            model="gemini-2.5-flash-preview-04-17",
-            google_api_key=api_key,
+        
+        # Main model for final response generation and context compression
+        self.llm_main = GoogleGenerativeAI(
+            model="gemini-2.5-flash-preview-04-17",  # Higher quality model
+            google_api_key=main_api_key,
             temperature=0.2,
             top_p=0.85,
             top_k=40,
             max_output_tokens=2048,
             streaming=True,
         )
-        logger.info("LLM initialized.")
+        
+        # Faster model for query optimization and reranking tasks
+        # You could use a different API key if needed
+        fast_api_key = os.getenv("FAST_MODEL_KEY", main_api_key)
+        
+        self.llm_fast = GoogleGenerativeAI(
+            model="gemini-1.5-flash",  # Faster/smaller model
+            google_api_key=fast_api_key,
+            temperature=0.1,  # Lower temperature for more deterministic outputs
+            top_p=0.9,
+            top_k=40,
+            max_output_tokens=1024,  # Smaller output size is fine for these tasks
+            streaming=False,  # No need for streaming with utility functions
+        )
+        
+        logger.info("LLM models initialized.")
 
     def initialize_retriever(self, client_email=None, chatbot_id=None):
         if client_email:
@@ -157,9 +178,12 @@ class SimpleRAGSystem:
         if not vectorstore:
             logger.warning(f"No vectorstore for {self.client_email}, chatbot {self.chatbot_id}")
             return False
+        
+        # Pass both models to the retriever
         self.retriever = AdaptiveRetriever(
             retriever=vectorstore.as_retriever(search_type="similarity"),
-            llm=self.llm
+            llm_main=self.llm_main,
+            llm_fast=self.llm_fast
         )
         logger.info(f"Retriever ready for {self.client_email}, chatbot {self.chatbot_id}")
         return True
@@ -170,7 +194,16 @@ class SimpleRAGSystem:
             return False
         prompt = PromptTemplate(
             template="""
-            You are a concise and accurate AI assistant. Use the context and chat history to answer the user's question.
+            You are a helpful, friendly, and conversational AI assistant. Use the context and chat history to answer the user's question in a natural, engaging way.
+            
+            When responding:
+            - Use a warm, personable tone with appropriate emotions
+            - Vary your sentence structure and length
+            - Use conversational language rather than overly formal speech
+            - Include occasional expressions of empathy, enthusiasm, or thoughtfulness
+            - Respond as if you're having a natural conversation with a friend or colleague
+            - Keep responses concise but complete
+            
             Chat History:
             {chat_history}
 
@@ -184,8 +217,9 @@ class SimpleRAGSystem:
             """.strip(),
             input_variables=["context", "question", "chat_history"]
         )
+        # Use main model for final response generation
         self.qa_chain = CustomRetrievalQAChain(
-            llm=self.llm,
+            llm=self.llm_main,
             prompt=prompt,
             retriever=self.retriever,
             verbose=False
@@ -201,13 +235,36 @@ class SimpleRAGSystem:
         ).strip()
 
     def _clean_response(self, response: str) -> str:
+        # Remove attribution phrases that sound robotic
         blacklist = [
             "Based on the document", "According to the context", "From the documents",
-            "Based on the context,", "Based on the information provided"
+            "Based on the context,", "Based on the information provided", "As per the context",
+            "The context mentions", "The document states", "According to the information",
+            "As mentioned in the context", "From the provided context", "The context provides"
         ]
+        
+        # First clean up the obvious robotic phrases
         for phrase in blacklist:
             response = response.replace(phrase, "")
-        return response.strip()
+        
+        # Further humanize the response by adding natural transitions if needed
+        response = response.strip()
+        
+        # If the response starts abruptly with certain patterns, make it more conversational
+        if re.match(r'^(The|This|These|Those|It|They)', response):
+            prefixes = [
+                "I'd be happy to help with that! ",
+                "Great question! ",
+                "Let me share what I know. ",
+                "I can help with that. ",
+                "Sure thing! ",
+                "Absolutely! "
+            ]
+            # Choose a prefix based on hash of the response for consistency
+            prefix_index = hash(response) % len(prefixes)
+            response = prefixes[prefix_index] + response
+            
+        return response
 
     def get_answer(self, query: str, chat_history: str | List[tuple[str, str]] = '', stream_callback=None, client_email: Optional[str] = None, chatbot_id: Optional[str] = None) -> Dict[str, Any]:
         client_changed = client_email and client_email != self.client_email
@@ -236,13 +293,22 @@ class SimpleRAGSystem:
             context, relevance_score = self.qa_chain.retrieve_context(query)
 
             if relevance_score < 0.3:
-                warning_msg = "⚠️ I'm not confident in the available information."
+                warning_msgs = [
+                    "I'm not entirely confident about this answer based on the information I have. ",
+                    "I'm doing my best with limited information on this topic. ",
+                    "I might not have all the details you need on this specific question. ",
+                    "This is a bit outside my knowledge base, but I'll try to help. ",
+                    "I'm not 100% certain about this, but here's what I understand. "
+                ]
+                # Choose a warning based on hash of the query for consistency
+                warning_index = hash(query) % len(warning_msgs)
+                warning_msg = warning_msgs[warning_index]
             else:
                 warning_msg = ""
 
             if stream_callback:
                 prompt_text = self.qa_chain.prompt.format(context=context, question=query, chat_history=formatted_history)
-                for chunk in self.llm.stream(prompt_text):
+                for chunk in self.llm_main.stream(prompt_text):
                     if hasattr(chunk, 'text'):
                         token = chunk.text
                         answer += token
@@ -257,7 +323,22 @@ class SimpleRAGSystem:
 
         except Exception as e:
             logger.error(f"QA failure for client '{self.client_email}', chatbot '{self.chatbot_id}': {e}")
-            answer = f"An error occurred: {str(e)}"
+            
+            # Friendly error messages that sound human
+            error_messages = [
+                f"I'm really sorry, but I ran into a technical glitch while processing your question. Our team has been notified. Could you try rephrasing or asking something else?",
+                f"Oops! Something went wrong on my end. This happens sometimes, and our team is working to fix these issues. Would you mind trying again in a moment?",
+                f"I apologize for the trouble! I hit a snag while processing your request. Maybe we could approach your question from a different angle?",
+                f"Well that's embarrassing! I encountered a technical issue. Our team has been notified, and I'd be happy to try again if you'd like to rephrase your question.",
+                f"I'm having a moment here - looks like I ran into a technical hiccup. Would you mind trying again? I'd really like to help you with this."
+            ]
+            
+            # Choose an error message based on the exception message hash for consistency
+            error_index = hash(str(e)) % len(error_messages)
+            answer = error_messages[error_index]
+            
+            # Add detailed error for admins in logs only
+            logger.debug(f"Detailed error: {str(e)}")
 
         self.interactions.append({
             "interaction_id": interaction_id,
@@ -274,7 +355,6 @@ class SimpleRAGSystem:
             "answer": answer,
             "interaction_id": interaction_id
         }
-
 
     def add_feedback(self, interaction_id, score, helpful):
         interaction = next((i for i in self.interactions if i["interaction_id"] == interaction_id), None)
