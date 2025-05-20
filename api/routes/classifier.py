@@ -2,10 +2,10 @@ from fastapi import APIRouter
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from google.genai import types
 import json
 import os
-import google.generativeai as genai
+from google import genai
 import logging
 import re
 
@@ -14,18 +14,7 @@ GOOGLE_API_KEY = os.getenv("GEMINI_KEY")
 if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY environment variable is not set")
 
-genai.configure(api_key=GOOGLE_API_KEY)
-
-# Initialize the model
-model = genai.GenerativeModel(
-    model_name="gemini-2.0-flash-lite",
-    safety_settings={
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-    }
-)
+client = genai.Client(api_key=GOOGLE_API_KEY)
 
 # Define models for request and response
 class PrivacyClassificationRequest(BaseModel):
@@ -135,7 +124,7 @@ def classify_privacy(user_data: Dict[str, Any], context: Optional[str] = None) -
     
     # Get response from Gemini
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model='gemini-2.0-flash-lite',contents=prompt)
         response_text = response.text
         logger.debug(f"Received response from Gemini: {response_text}")
     except Exception as e:

@@ -40,12 +40,12 @@ filetype==1.2.0
 flatbuffers==25.2.10
 frozenlist==1.6.0
 fsspec==2025.3.2
-google-ai-generativelanguage==0.6.15
+google-ai-generativelanguage==0.6.18
 google-api-core==2.24.2
 google-api-python-client==2.169.0
 google-auth==2.40.1
 google-auth-httplib2==0.2.0
-google-generativeai==0.8.5
+google-genai==1.16.1
 googleapis-common-protos==1.70.0
 greenlet==3.2.1
 grpcio==1.71.0
