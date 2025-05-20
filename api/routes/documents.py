@@ -13,7 +13,7 @@ from utils.vectorStore import (
 # Set up logging
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/chatbots/{chatbot_id}/documents", tags=["documents"])
+router = APIRouter(prefix="/api/chatbots/documents", tags=["documents"])
 
 @router.post("", response_model=dict)
 async def add_documents(

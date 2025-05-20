@@ -1,6 +1,6 @@
 import uuid
 import logging
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks, Query
 from typing import List
 from pydantic import EmailStr
 
@@ -13,6 +13,7 @@ from utils.vectorStore import (
     list_client_chatbots
 )
 from utils.rag import get_rag_system
+from database import chat_logs_collection
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -68,13 +69,16 @@ async def create_chatbot(
     }
 
 @router.delete("/{chatbot_id}", response_model=dict)
-async def remove_chatbot(chatbot_id: str, client_email: EmailStr):
+async def remove_chatbot(chatbot_id: str, client_email: EmailStr = Query(...)):
     """Delete a chatbot."""
     if not get_vectorstore(client_email, chatbot_id):
         raise HTTPException(status_code=404, detail=f"Chatbot ID {chatbot_id} not found")
     
     try:
         reset_vectorstore(client_email, chatbot_id)
+        # Delete associated chat logs
+        chat_logs_collection.delete_many({"chatbot_id": chatbot_id})
+        logger.info(f"Deleted chat logs for chatbot: {chatbot_id}")
         return {"status": "success", "message": "Chatbot deleted successfully"}
     except Exception as e:
         logger.error(f"Error deleting chatbot: {e}")

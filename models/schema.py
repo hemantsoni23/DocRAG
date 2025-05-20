@@ -1,5 +1,6 @@
 from pydantic import BaseModel, EmailStr, Field, validator
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
+from datetime import datetime
 
 class ChatbotCreate(BaseModel):
     name: str = Field(..., description="Name of the chatbot")
@@ -17,8 +18,8 @@ class ChatRequest(BaseModel):
 
 class FeedbackRequest(BaseModel):
     interaction_id: str
-    score: int = Field(..., ge=1, le=5)
-    helpful: bool
+    score: int = Field(..., ge=0, le=5)
+    helpful: bool = True
     client_email: EmailStr
     chatbot_id: str
 
@@ -45,3 +46,16 @@ class SystemStats(BaseModel):
     helpful_percentage: float = 0.0
     average_score: float = 0.0
     documents_with_feedback: int = 0
+
+class ChatLog(BaseModel):
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    client_email: EmailStr
+    chatbot_id: str
+    question: str
+    answer: str
+    interaction_id: Optional[str] = None
+    history: Optional[List[ChatHistory]] = []
+
+class UpdateChatLogs(BaseModel):
+    interaction_id: Optional[str]
+    answer: str
