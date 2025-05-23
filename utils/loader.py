@@ -45,8 +45,8 @@ def load_docx(file_path):
         logger.info(f"📄 Loading DOCX file: {file_path}")
         # Try to import and use Docx2txtLoader
         try:
-            from langchain_community.document_loaders import Docx2txtLoader
-            loader = Docx2txtLoader(file_path)
+            from langchain_community.document_loaders import UnstructuredWordDocumentLoader
+            loader = UnstructuredWordDocumentLoader(file_path)
             return loader.load()
         except ImportError:
             logger.warning("Docx2txtLoader not available. Trying UnstructuredWordDocumentLoader...")

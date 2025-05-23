@@ -9,3 +9,4 @@ db = client.chatbase
 # Collection for chat logs
 chat_logs_collection = db.chat_logs
 feedback_collection = db.feedback
+agents_collection = db.agents

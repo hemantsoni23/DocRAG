@@ -9,16 +9,32 @@ from services.file_service import process_files, split_into_chunks
 from utils.vectorStore import (
     get_vectorstore, update_vectorstore, delete_document, _load_metadata
 )
+from database import agents_collection
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chatbots/documents", tags=["documents"])
 
+def change_num_of_documents(chatbot_id: str, num: int):
+    """
+    Change the number of documents in the database for a given chatbot.
+    Positive num increases the count, negative num decreases it.
+    """
+    try:
+        # Use $inc operator to add/subtract from the current value
+        agents_collection.update_one(
+            {"chatbot_id": chatbot_id},
+            {"$inc": {"num_documents": num}}
+        )
+    except Exception as e:
+        logger.error(f"Error updating number of documents: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 @router.post("", response_model=dict)
 async def add_documents(
-    chatbot_id: str,
     background_tasks: BackgroundTasks,
+    chatbot_id: str = Form(...),
     client_email: EmailStr = Form(...),
     files: List[UploadFile] = File(...)
 ):
@@ -41,7 +57,9 @@ async def add_documents(
     status = f"Added {processed} files to chatbot"
     if failed:
         status += f". {failed} file(s) failed."
-    
+
+    change_num_of_documents(chatbot_id, len(files))
+
     return {"status": "success", "message": status}
 
 @router.get("", response_model=List[DocumentResponse])
@@ -101,7 +119,9 @@ async def remove_document(chatbot_id: str, document_name: str, client_email: Ema
                 
         if not success:
             raise HTTPException(status_code=500, detail=f"Failed to delete some parts of document: {document_name}")
-            
+        
+        change_num_of_documents(chatbot_id, -1 * len(docs_to_delete))
+
         return {
             "status": "success", 
             "message": f"Deleted document: {document_name} ({total_chunks} chunks removed)"

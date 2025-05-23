@@ -15,73 +15,58 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
+def format_history_for_rag(history: List[ChatHistory]) -> List[tuple[str, str]]:
+    formatted = []
+    for i in range(0, len(history) - 1, 2):
+        if i + 1 < len(history):
+            if history[i].role == "user" and history[i + 1].role == "assistant":
+                formatted.append((history[i].content, history[i + 1].content))
+    return formatted
+
+
+async def sse_event_generator(
+    message: str,
+    history: List[ChatHistory],
+    client_email: str,
+    chatbot_id: str
+) -> AsyncGenerator[str, None]:
+    try:
+        rag_system = get_rag_system(client_email, chatbot_id)
+        formatted_history = format_history_for_rag(history)
+
+        # Wrap sync generator as async generator
+        loop = asyncio.get_event_loop()
+        gen = rag_system.get_answer_stream(
+            query=message,
+            chat_history=formatted_history,
+            client_email=client_email,
+            chatbot_id=chatbot_id
+        )
+
+        for token in gen:
+            # SSE format: "data: <line>\n\n"
+            yield f"data: {token}\n\n"
+            await asyncio.sleep(0)  # Yield control to event loop
+
+        # End of stream message (optional)
+        yield "event: end\ndata: [DONE]\n\n"
+
+    except Exception as e:
+        logger.error(f"SSE chat streaming error: {str(e)}")
+        yield f"event: error\ndata: An error occurred: {str(e)}\n\n"
+
+
 @router.post("/chat/stream")
 async def stream_chat_with_bot(request: ChatRequest):
-    """Stream a message to chat with a specific chatbot."""
-
-    client_email = request.client_email
-    chatbot_id = request.chatbot_id
-    message = request.message
-
-    if not message.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
-
-    if not get_vectorstore(client_email, chatbot_id):
-        raise HTTPException(status_code=404, detail="This chatbot has no documents or does not exist")
-
-    rag_system = get_rag_system(client_email, chatbot_id)
-
-    # Format chat history
-    formatted_history = []
-    for i in range(0, len(request.history) - 1, 2):
-        if i + 1 < len(request.history):
-            if request.history[i].role == "user" and request.history[i + 1].role == "assistant":
-                formatted_history.append((request.history[i].content, request.history[i + 1].content))
-
-    async def token_generator() -> AsyncGenerator[bytes, None]:
-        try:
-            def stream_callback(token: str):
-                yield_data = f"data: {token}\n\n"
-                yield_bytes = yield_data.encode("utf-8")
-                yield yield_bytes  # Yield SSE-compatible stream token-by-token
-            
-            # Bridge callback-style streaming with generator
-            loop = asyncio.get_event_loop()
-            queue = asyncio.Queue()
-
-            def enqueue_token(token):
-                loop.call_soon_threadsafe(queue.put_nowait, token)
-
-            def callback_handler(token: str):
-                enqueue_token(token)
-
-            async def generate():
-                try:
-                    rag_system.get_answer(
-                        message,
-                        chat_history=formatted_history,
-                        stream_callback=callback_handler,
-                        client_email=client_email,
-                        chatbot_id=chatbot_id,
-                    )
-                    await queue.put(None)  # Sentinel for end of stream
-                except Exception as e:
-                    logger.error(f"Streaming failed: {e}")
-                    await queue.put(None)
-
-            asyncio.create_task(generate())
-
-            while True:
-                token = await queue.get()
-                if token is None:
-                    break
-                yield f"data: {token}\n\n".encode("utf-8")
-
-        except Exception as e:
-            logger.error(f"Error during stream: {e}")
-            yield f"data: [Error] {str(e)}\n\n".encode("utf-8")
-
-    return StreamingResponse(token_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        sse_event_generator(
+            message=request.message,
+            history=request.history,
+            client_email=request.client_email,
+            chatbot_id=request.chatbot_id
+        ),
+        media_type="text/event-stream"
+    )
 
 @router.post("/chat", response_model=dict)
 async def chat_with_bot(request: ChatRequest):

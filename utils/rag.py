@@ -52,8 +52,8 @@ class AdaptiveRetriever:
         self.retriever = retriever
         self.llm_main = llm_main
         self.llm_fast = llm_fast or llm_main
-        self.optimizer = QueryOptimizer(self.llm_fast)  # Use faster model for query optimization
-        self.compressor = ContextCompressor(self.llm_main)  # Keep main model for compression
+        self.optimizer = QueryOptimizer(self.llm_fast)
+        self.compressor = ContextCompressor(self.llm_main)
 
     @lru_cache(maxsize=128)
     def get_documents(self, query: str) -> Tuple[List[Document], float]:
@@ -80,18 +80,30 @@ class AdaptiveRetriever:
         return "\n\n".join(doc.page_content.strip() for doc in docs)
 
     def _estimate_relevance_score(self, query: str, context: str) -> float:
-        # Simple heuristic-based scoring (no LLM needed)
+        # Enhanced relevance scoring
         query_words = set(query.lower().split())
         context_words = set(context.lower().split())
         common = query_words & context_words
-        score = len(common) / max(len(query_words), 1)
-        return min(max(score, 0.2), 1.0)
+        
+        # Base score from word overlap
+        base_score = len(common) / max(len(query_words), 1)
+        
+        # Boost score if query contains specific terms found in context
+        query_lower = query.lower()
+        context_lower = context.lower()
+        
+        # Check for exact phrase matches
+        query_phrases = [phrase.strip() for phrase in query_lower.split() if len(phrase.strip()) > 3]
+        phrase_matches = sum(1 for phrase in query_phrases if phrase in context_lower)
+        phrase_boost = (phrase_matches / max(len(query_phrases), 1)) * 0.3
+        
+        final_score = min(base_score + phrase_boost, 1.0)
+        return max(final_score, 0.1)  # Minimum score to avoid complete zeros
 
     def _rerank_with_llm(self, query: str, docs: List[Document]) -> Tuple[List[Document], float]:
         context = "\n\n".join([f"Doc {i+1}: {doc.page_content}" for i, doc in enumerate(docs)])
         prompt = f"""You are an expert AI evaluator.\nGiven the user query: "{query}"\nand these documents:\n\n{context}\n\nRank documents by relevance, output document numbers separated by commas. Also, rate overall document relevance to the query on a 0-1 scale (1=perfect).\nExample Output:\n"Ranking: 3,1,2\nRelevance Score: 0.85" """
         try:
-            # Use faster model for reranking
             response = self.llm_fast.invoke(prompt).strip()
             lines = response.splitlines()
             doc_line = next(line for line in lines if line.startswith("Ranking"))
@@ -115,11 +127,14 @@ class CustomRetrievalQAChain(LLMChain):
     def invoke(self, inputs: Dict[str, Any], run_manager=None):
         query = inputs["question"]
         chat_history = inputs.get("chat_history", "")
-        context, _ = self.retrieve_context(query)
+        context, relevance_score = self.retrieve_context(query)
+        
+        # Pass relevance score for decision making
         return super().invoke({
             "context": context,
             "question": query,
             "chat_history": chat_history,
+            "relevance_score": relevance_score,
         }, run_manager=run_manager)
 
 class SimpleRAGSystem:
@@ -133,37 +148,33 @@ class SimpleRAGSystem:
         self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
         self.feedback_store = []
         self.interactions = []
+        # Set minimum relevance threshold for answering questions
+        self.min_relevance_threshold = 0.4  # Increased from 0.3
         self.initialize_models()
 
     def initialize_models(self):
-        # Initialize main (higher-quality) model
         main_api_key = os.getenv("GEMINI_KEY")
         if not main_api_key:
             raise ValueError("GEMINI_KEY not found")
         
-        # Main model for final response generation and context compression
         self.llm_main = GoogleGenerativeAI(
-            model="gemini-2.5-flash-preview-04-17",  # Higher quality model
+            model="gemini-2.5-flash-preview-04-17",
             google_api_key=main_api_key,
-            temperature=0.2,
-            top_p=0.85,
-            top_k=40,
+            temperature=0.1,  # Reduced temperature for more focused responses
+            top_p=0.8,        # Reduced for more focused responses
+            top_k=20,         # Reduced for more focused responses
             max_output_tokens=2048,
-            streaming=True,
         )
         
-        # Faster model for query optimization and reranking tasks
-        # You could use a different API key if needed
         fast_api_key = os.getenv("FAST_MODEL_KEY", main_api_key)
         
         self.llm_fast = GoogleGenerativeAI(
-            model="gemini-1.5-flash",  # Faster/smaller model
+            model="gemini-1.5-flash",
             google_api_key=fast_api_key,
-            temperature=0.1,  # Lower temperature for more deterministic outputs
+            temperature=0.05,  # Very low temperature for deterministic tasks
             top_p=0.9,
             top_k=40,
-            max_output_tokens=1024,  # Smaller output size is fine for these tasks
-            streaming=False,  # No need for streaming with utility functions
+            max_output_tokens=1024,  
         )
         
         logger.info("LLM models initialized.")
@@ -179,7 +190,6 @@ class SimpleRAGSystem:
             logger.warning(f"No vectorstore for {self.client_email}, chatbot {self.chatbot_id}")
             return False
         
-        # Pass both models to the retriever
         self.retriever = AdaptiveRetriever(
             retriever=vectorstore.as_retriever(search_type="similarity"),
             llm_main=self.llm_main,
@@ -192,32 +202,35 @@ class SimpleRAGSystem:
         if not self.retriever:
             logger.warning("Retriever missing.")
             return False
+            
+        # Updated prompt with more conversational and friendly tone
         prompt = PromptTemplate(
             template="""
-            You are a helpful, friendly, and conversational AI assistant. Use the context and chat history to answer the user's question in a natural, engaging way.
-            
-            When responding:
-            - Use a warm, personable tone with appropriate emotions
-            - Vary your sentence structure and length
-            - Use conversational language rather than overly formal speech
-            - Include occasional expressions of empathy, enthusiasm, or thoughtfulness
-            - Respond as if you're having a natural conversation with a friend or colleague
-            - Keep responses concise but complete
-            
+            You are a helpful, friendly, and conversational AI assistant created by Mapaman. You are designed to help users explore and understand the documents in your knowledge base.
+
+            IMPORTANT GUIDELINES:
+            - Be warm, friendly, and conversational in your responses
+            - Use the provided context to answer questions about the documents
+            - If you can answer from the context, provide a complete and helpful response
+            - If the context doesn't contain enough information, politely explain that you don't have that information in your document collection
+            - Always maintain a helpful and engaging tone
+            - Encourage users to ask more questions about the documents
+
             Chat History:
             {chat_history}
 
-            Relevant Context:
+            Relevant information from your document collection:
             {context}
 
-            Question:
-            {question}
+            User's question: {question}
 
-            Answer:
+            Instructions: Answer the user's question in a friendly, conversational way. If you can find relevant information in the context above, use it to provide a helpful response. If the context doesn't contain enough information to answer the question, politely let them know and encourage them to ask about topics covered in your documents.
+
+            Response:
             """.strip(),
             input_variables=["context", "question", "chat_history"]
         )
-        # Use main model for final response generation
+        
         self.qa_chain = CustomRetrievalQAChain(
             llm=self.llm_main,
             prompt=prompt,
@@ -234,37 +247,245 @@ class SimpleRAGSystem:
             f"Human: {user}\nAssistant: {assistant or ''}" for user, assistant in chat_history
         ).strip()
 
-    def _clean_response(self, response: str) -> str:
-        # Remove attribution phrases that sound robotic
-        blacklist = [
-            "Based on the document", "According to the context", "From the documents",
-            "Based on the context,", "Based on the information provided", "As per the context",
-            "The context mentions", "The document states", "According to the information",
-            "As mentioned in the context", "From the provided context", "The context provides"
+    def _classify_query_type(self, query: str) -> str:
+        """
+        Classify query into different types for appropriate handling
+        Returns: 'greeting', 'capability', 'conversational', 'factual_out_of_scope', 'factual_in_scope'
+        """
+        query_lower = query.lower().strip()
+        
+        # Greeting patterns
+        greeting_patterns = [
+            r'^(hi|hello|hey|good morning|good afternoon|good evening|greetings)',
+            r'^(what\'s up|how are you|how\'s it going)',
+            r'(hi there|hey there|hello there)',
         ]
         
-        # First clean up the obvious robotic phrases
-        for phrase in blacklist:
-            response = response.replace(phrase, "")
+        # Capability/meta questions
+        capability_patterns = [
+            r'what can you do',
+            r'how can you help',
+            r'what are you capable of',
+            r'what is your purpose',
+            r'what are your abilities',
+            r'how do you work',
+            r'what kind of questions can i ask',
+            r'what do you know about',
+        ]
         
-        # Further humanize the response by adding natural transitions if needed
-        response = response.strip()
+        # General conversational (but not when followed by actual questions)
+        conversational_patterns = [
+            r'^(thanks|thank you|appreciated)(?!\s+.+)',  # Thanks but not "thanks for telling me about X"
+            r'^(ok|okay|alright|sure|fine)(?!\s+(?:yes|tell|show|explain|what|who|how|where|when|why))',  # Ok but not "ok yes tell me" or "ok what about"
+            r'^(good|great|nice|cool|awesome)(?!\s+.+)',  # Good but not "good question about X"
+            r'(how was your day|tell me about yourself)',
+            r'^(bye|goodbye|see you|farewell)(?!\s+.+)',  # Goodbye but not "goodbye, but first tell me"
+        ]
         
-        # If the response starts abruptly with certain patterns, make it more conversational
-        if re.match(r'^(The|This|These|Those|It|They)', response):
-            prefixes = [
-                "I'd be happy to help with that! ",
-                "Great question! ",
-                "Let me share what I know. ",
-                "I can help with that. ",
-                "Sure thing! ",
-                "Absolutely! "
-            ]
-            # Choose a prefix based on hash of the response for consistency
-            prefix_index = hash(response) % len(prefixes)
-            response = prefixes[prefix_index] + response
+        # Factual questions that are clearly out of scope (general knowledge)
+        factual_out_of_scope_patterns = [
+            r"who\s+(?:is|are|was|were)\s+(?:monkey\s+d\.?\s+luffy|naruto|goku|superman|batman|spiderman)",
+            r"what\s+(?:is|are)\s+(?:the\s+)?(?:weather|time|date|news)",
+            r"tell\s+me\s+about\s+(?:python|javascript|programming|cooking|sports)",
+            r"how\s+to\s+(?:cook|program|drive|fly)",
+            r"what\s+(?:is|are)\s+(?:the\s+)?capital\s+of",
+            r"when\s+(?:was|were|did)",
+            r"where\s+(?:is|are|was|were)",
+        ]
+        
+    def _classify_query_type(self, query: str) -> str:
+        """
+        Classify query into different types for appropriate handling
+        Returns: 'greeting', 'capability', 'conversational', 'factual_out_of_scope', 'factual_in_scope'
+        """
+        query_lower = query.lower().strip()
+        
+        # First check if it's a continuation/follow-up question
+        continuation_patterns = [
+            r'(?:ok|okay|alright|sure|yes)\s+(?:yes|tell|show|explain|what|who|how|where|when|why)',
+            r'(?:ok|okay|alright|sure|yes)\s+.+(?:about|more|tell|explain|show)',
+            r'(?:and|also|additionally)\s+(?:what|who|how|where|when|why)',
+            r'tell me more',
+            r'explain (?:more|further|that)',
+            r'what (?:about|else)',
+            r'anything else about',
+        ]
+        
+        for pattern in continuation_patterns:
+            if re.search(pattern, query_lower):
+                return 'factual_in_scope'  # Treat as factual question
+        
+        # Greeting patterns
+        greeting_patterns = [
+            r'^(hi|hello|hey|good morning|good afternoon|good evening|greetings)',
+            r'^(what\'s up|how are you|how\'s it going)',
+            r'(hi there|hey there|hello there)',
+        ]
+        
+        # Capability/meta questions
+        capability_patterns = [
+            r'what can you do',
+            r'how can you help',
+            r'what are you capable of',
+            r'what is your purpose',
+            r'what are your abilities',
+            r'how do you work',
+            r'what kind of questions can i ask',
+            r'what do you know about',
+        ]
+        
+        # General conversational (but not when followed by actual questions)
+        conversational_patterns = [
+            r'^(thanks|thank you|appreciated)(?!\s+.+)',  # Thanks but not "thanks for telling me about X"
+            r'^(ok|okay|alright|sure|fine)(?!\s+(?:yes|tell|show|explain|what|who|how|where|when|why))',  # Ok but not "ok yes tell me" or "ok what about"
+            r'^(good|great|nice|cool|awesome)(?!\s+.+)',  # Good but not "good question about X"
+            r'(how was your day|tell me about yourself)',
+            r'^(bye|goodbye|see you|farewell)(?!\s+.+)',  # Goodbye but not "goodbye, but first tell me"
+        ]
+        
+        # Factual questions that are clearly out of scope (general knowledge)
+        factual_out_of_scope_patterns = [
+            r"who\s+(?:is|are|was|were)\s+(?:monkey\s+d\.?\s+luffy|naruto|goku|superman|batman|spiderman)",
+            r"what\s+(?:is|are)\s+(?:the\s+)?(?:weather|time|date|news)",
+            r"tell\s+me\s+about\s+(?:python|javascript|programming|cooking|sports)",
+            r"how\s+to\s+(?:cook|program|drive|fly)",
+            r"what\s+(?:is|are)\s+(?:the\s+)?capital\s+of",
+            r"when\s+(?:was|were|did)",
+            r"where\s+(?:is|are|was|were)",
+        ]
+        
+        # Check patterns in order of priority
+        for pattern in greeting_patterns:
+            if re.search(pattern, query_lower):
+                return 'greeting'
+                
+        for pattern in capability_patterns:
+            if re.search(pattern, query_lower):
+                return 'capability'
+                
+        for pattern in conversational_patterns:
+            if re.search(pattern, query_lower):
+                return 'conversational'
+                
+        for pattern in factual_out_of_scope_patterns:
+            if re.search(pattern, query_lower):
+                return 'factual_out_of_scope'
+        
+        # Check for creator questions separately
+        creator_patterns = [
+            r"who\s+(?:is|are|was|were)\s+(?:the\s+)?creator",
+            r"who\s+(?:made|created|built|developed)\s+you",
+            r"what\s+(?:is|are)\s+your\s+(?:name|creator|maker)",
+        ]
+        
+        for pattern in creator_patterns:
+            if re.search(pattern, query_lower):
+                return 'factual_out_of_scope'  # Handle as out of scope but with creator response
+        
+        # Default to factual (will be checked against context)
+        return 'factual_in_scope'
+
+    def _is_out_of_scope(self, query: str, context: str, relevance_score: float, query_type: str) -> bool:
+        """
+        Determine if a query is out of scope based on query type and relevance score
+        """
+        # Never consider conversational queries as out of scope
+        if query_type in ['greeting', 'capability', 'conversational']:
+            return False
             
-        return response
+        # Factual questions that are clearly out of scope
+        if query_type == 'factual_out_of_scope':
+            return True
+            
+        # For factual questions, check relevance score
+        if query_type == 'factual_in_scope' and relevance_score < self.min_relevance_threshold:
+            return True
+                    
+        return False
+
+    def _generate_conversational_response(self, query: str, query_type: str) -> str:
+        """Generate appropriate conversational responses"""
+        
+        if query_type == 'greeting':
+            greetings = [
+                "Hello! Great to meet you! I'm here to help answer questions about the documents in my knowledge base. What would you like to know?",
+                "Hi there! Nice to chat with you! I'm ready to help you explore the information from the uploaded documents. What can I assist you with?",
+                "Hey! Thanks for stopping by! I'm here to help you find answers from the documents that have been shared with me. What are you curious about?",
+                "Hello! I'm excited to help you today! I can answer questions based on the documents in my knowledge base. What would you like to discover?",
+                "Hi! It's wonderful to connect with you! I'm here to help you navigate through the information in my document collection. How can I assist you?",
+            ]
+            return greetings[hash(query) % len(greetings)]
+            
+        elif query_type == 'capability':
+            capabilities = [
+                "I'm here to help you explore and understand the documents that have been uploaded to my knowledge base! I can answer questions, explain concepts, find specific information, and discuss topics covered in those documents. What would you like to know about?",
+                "Great question! I'm designed to be your friendly guide through the document collection in my knowledge base. I can help you find answers, clarify information, summarize content, and discuss any topics covered in those materials. What interests you most?",
+                "I'd love to help! I specialize in answering questions about the specific documents that have been shared with me. I can search through them, explain complex topics, provide summaries, and help you understand the content better. What would you like to explore?",
+                "I'm your personal assistant for navigating the documents in my knowledge base! I can help you find specific information, answer questions about the content, explain difficult concepts, and discuss any topics covered in those materials. What can I help you discover?",
+                "Thanks for asking! I'm here to make the information in my document collection accessible and easy to understand. I can answer questions, provide explanations, find relevant details, and help you explore the topics covered. What would you like to learn about?",
+            ]
+            return capabilities[hash(query) % len(capabilities)]
+            
+        elif query_type == 'conversational':
+            # Handle different conversational patterns
+            query_lower = query.lower()
+            
+            if any(word in query_lower for word in ['thanks', 'thank you', 'appreciated']):
+                thanks_responses = [
+                    "You're very welcome! I'm always happy to help. If you have any other questions about the documents, feel free to ask!",
+                    "My pleasure! It's great to be able to help you find the information you need. Don't hesitate to ask if you have more questions!",
+                    "Absolutely! I'm glad I could assist you. If there's anything else from the documents you'd like to explore, just let me know!",
+                    "You're so welcome! I really enjoy helping people discover interesting information. Feel free to ask about anything else!",
+                ]
+                return thanks_responses[hash(query) % len(thanks_responses)]
+                
+            elif any(word in query_lower for word in ['bye', 'goodbye', 'see you', 'farewell']):
+                goodbye_responses = [
+                    "Goodbye! It was wonderful helping you today. Feel free to come back anytime with more questions!",
+                    "See you later! I really enjoyed our conversation. Don't hesitate to return if you need help with the documents!",
+                    "Take care! It was great chatting with you. I'm always here when you need assistance with your questions!",
+                    "Farewell! Thanks for the great conversation. I'll be here whenever you want to explore more information!",
+                ]
+                return goodbye_responses[hash(query) % len(goodbye_responses)]
+                
+            else:
+                # General positive conversational responses
+                general_responses = [
+                    "I'm doing well, thank you for asking! I'm here and ready to help you with any questions about the documents. What would you like to know?",
+                    "Things are great on my end! I'm excited to help you explore the information in my knowledge base. What interests you?",
+                    "I'm fantastic, thanks! I love helping people discover interesting information from documents. What can I help you find today?",
+                    "All good here! I'm always energized when I get to help someone learn something new. What would you like to explore?",
+                ]
+                return general_responses[hash(query) % len(general_responses)]
+        
+        # Fallback
+    def _generate_out_of_scope_response(self, query: str, query_type: str) -> str:
+        """Generate appropriate response for out-of-scope questions"""
+        
+        # Handle creator questions specifically
+        creator_patterns = [
+            r"who\s+(?:is|are|was|were)\s+(?:the\s+)?creator",
+            r"who\s+(?:made|created|built|developed)\s+you",
+            r"what\s+(?:is|are)\s+your\s+(?:name|creator|maker)",
+        ]
+        
+        query_lower = query.lower()
+        for pattern in creator_patterns:
+            if re.search(pattern, query_lower):
+                return "I was created by Mapaman! I'm here to help you explore and understand the documents in my knowledge base. Is there anything specific from those documents you'd like to learn about?"
+        
+        # Friendly out-of-scope responses for factual questions
+        responses = [
+            "I wish I could help with that, but I don't have information on that topic in my knowledge base. I specialize in the documents that have been uploaded to me. Is there something from those materials you'd like to explore instead?",
+            "That's an interesting question, but it's outside my area of expertise! I focus on the specific documents in my knowledge base. What would you like to discover from those materials?",
+            "I'd love to help, but I don't have reliable information about that topic. I'm designed to be your guide through the uploaded documents. What aspects of those documents would you like to learn about?",
+            "Great question! Unfortunately, that's beyond what I can confidently answer since it's not covered in my document collection. However, I'm really knowledgeable about the materials that have been shared with me. What would you like to explore from those?",
+            "I appreciate the question, but I don't have enough information about that topic to give you a good answer. I specialize in the documents in my knowledge base though! Is there anything from those materials you're curious about?",
+        ]
+        
+        # Choose response based on query hash for consistency
+        response_index = hash(query) % len(responses)
+        return responses[response_index]
 
     def get_answer(self, query: str, chat_history: str | List[tuple[str, str]] = '', stream_callback=None, client_email: Optional[str] = None, chatbot_id: Optional[str] = None) -> Dict[str, Any]:
         client_changed = client_email and client_email != self.client_email
@@ -284,60 +505,55 @@ class SimpleRAGSystem:
 
         interaction_id = str(uuid.uuid4())
         formatted_history = self._format_chat_history(chat_history)
-        inputs = {"question": query, "chat_history": formatted_history}
         answer = ""
         relevance_score = 0.0
-        warning_msg = ""
 
         try:
-            context, relevance_score = self.qa_chain.retrieve_context(query)
-
-            if relevance_score < 0.3:
-                warning_msgs = [
-                    "I'm not entirely confident about this answer based on the information I have. ",
-                    "I'm doing my best with limited information on this topic. ",
-                    "I might not have all the details you need on this specific question. ",
-                    "This is a bit outside my knowledge base, but I'll try to help. ",
-                    "I'm not 100% certain about this, but here's what I understand. "
-                ]
-                # Choose a warning based on hash of the query for consistency
-                warning_index = hash(query) % len(warning_msgs)
-                warning_msg = warning_msgs[warning_index]
+            # Classify the query type first
+            query_type = self._classify_query_type(query)
+            
+            # Handle conversational queries without context retrieval
+            if query_type in ['greeting', 'capability', 'conversational']:
+                answer = self._generate_conversational_response(query, query_type)
             else:
-                warning_msg = ""
-
-            if stream_callback:
-                prompt_text = self.qa_chain.prompt.format(context=context, question=query, chat_history=formatted_history)
-                for chunk in self.llm_main.stream(prompt_text):
-                    if hasattr(chunk, 'text'):
-                        token = chunk.text
-                        answer += token
-                        stream_callback(token)
-            else:
-                result = self.qa_chain.invoke(inputs)
-                raw_answer = result.get("text", "")
-                answer = self._clean_response(raw_answer)
-
-            if warning_msg:
-                answer = f"{warning_msg}\n\n{answer}"
+                # Get context and relevance score for factual queries
+                context, relevance_score = self.qa_chain.retrieve_context(query)
+                
+                # Check if query is out of scope
+                if self._is_out_of_scope(query, context, relevance_score, query_type):
+                    answer = self._generate_out_of_scope_response(query, query_type)
+                else:
+                    # Process normally for in-scope queries
+                    inputs = {"question": query, "chat_history": formatted_history}
+                    
+                    if stream_callback:
+                        prompt_text = self.qa_chain.prompt.format(
+                            context=context, 
+                            question=query, 
+                            chat_history=formatted_history
+                        )
+                        for chunk in self.llm_main.stream(prompt_text):
+                            if hasattr(chunk, 'text'):
+                                token = chunk.text
+                                answer += token
+                                stream_callback(token)
+                    else:
+                        result = self.qa_chain.invoke(inputs)
+                        answer = result.get("text", "")
 
         except Exception as e:
             logger.error(f"QA failure for client '{self.client_email}', chatbot '{self.chatbot_id}': {e}")
             
-            # Friendly error messages that sound human
             error_messages = [
-                f"I'm really sorry, but I ran into a technical glitch while processing your question. Our team has been notified. Could you try rephrasing or asking something else?",
-                f"Oops! Something went wrong on my end. This happens sometimes, and our team is working to fix these issues. Would you mind trying again in a moment?",
-                f"I apologize for the trouble! I hit a snag while processing your request. Maybe we could approach your question from a different angle?",
-                f"Well that's embarrassing! I encountered a technical issue. Our team has been notified, and I'd be happy to try again if you'd like to rephrase your question.",
-                f"I'm having a moment here - looks like I ran into a technical hiccup. Would you mind trying again? I'd really like to help you with this."
+                "I'm really sorry, but I ran into a technical glitch while processing your question. Our team has been notified. Could you try rephrasing or asking something else?",
+                "Oops! Something went wrong on my end. This happens sometimes, and our team is working to fix these issues. Would you mind trying again in a moment?",
+                "I apologize for the trouble! I hit a snag while processing your request. Maybe we could approach your question from a different angle?",
+                "Well that's embarrassing! I encountered a technical issue. Our team has been notified, and I'd be happy to try again if you'd like to rephrase your question.",
+                "I'm having a moment here - looks like I ran into a technical hiccup. Would you mind trying again? I'd really like to help you with this."
             ]
             
-            # Choose an error message based on the exception message hash for consistency
             error_index = hash(str(e)) % len(error_messages)
             answer = error_messages[error_index]
-            
-            # Add detailed error for admins in logs only
             logger.debug(f"Detailed error: {str(e)}")
 
         self.interactions.append({
@@ -355,6 +571,90 @@ class SimpleRAGSystem:
             "answer": answer,
             "interaction_id": interaction_id
         }
+    
+    def get_answer_stream(
+        self,
+        query: str,
+        chat_history: str | List[tuple[str, str]] = '',
+        client_email: Optional[str] = None,
+        chatbot_id: Optional[str] = None
+    ):
+        client_changed = client_email and client_email != self.client_email
+        chatbot_changed = chatbot_id and chatbot_id != self.chatbot_id
+
+        if client_changed or chatbot_changed:
+            self.client_email = client_email or self.client_email
+            self.chatbot_id = chatbot_id or self.chatbot_id
+            self.initialize_retriever(self.client_email, self.chatbot_id)
+            self.setup_rag_chain()
+
+        if not self.retriever or not self.qa_chain:
+            if not self.initialize_retriever():
+                yield f"Please upload documents for chatbot '{self.chatbot_id}'."
+                return
+            if not self.setup_rag_chain():
+                yield "Could not initialize QA."
+                return
+
+        interaction_id = str(uuid.uuid4())
+        formatted_history = self._format_chat_history(chat_history)
+        answer = ""
+        relevance_score = 0.0
+
+        try:
+            # Classify the query type first
+            query_type = self._classify_query_type(query)
+            
+            # Handle conversational queries without context retrieval
+            if query_type in ['greeting', 'capability', 'conversational']:
+                answer = self._generate_conversational_response(query, query_type)
+                yield answer
+            else:
+                context, relevance_score = self.qa_chain.retrieve_context(query)
+                
+                # Check if query is out of scope
+                if self._is_out_of_scope(query, context, relevance_score, query_type):
+                    out_of_scope_response = self._generate_out_of_scope_response(query, query_type)
+                    answer = out_of_scope_response
+                    yield out_of_scope_response
+                else:
+                    # Stream response for in-scope queries
+                    prompt_text = self.qa_chain.prompt.format(
+                        context=context,
+                        question=query,
+                        chat_history=formatted_history
+                    )
+
+                    for chunk in self.llm_main.stream(prompt_text):
+                        if hasattr(chunk, "text"):
+                            token = chunk.text
+                            answer += token
+                            yield token
+
+        except Exception as e:
+            logger.error(f"QA failure for client '{self.client_email}', chatbot '{self.chatbot_id}': {e}")
+            error_messages = [
+                "I'm really sorry, but I ran into a technical glitch while processing your question.",
+                "Oops! Something went wrong on my end. Please try again in a moment.",
+                "I hit a snag while processing your request. Maybe we could approach it from a different angle?",
+                "Well that's embarrassing! I encountered a technical issue. Please try rephrasing.",
+                "Looks like I ran into a technical hiccup. Would you mind trying again?"
+            ]
+            error_index = hash(str(e)) % len(error_messages)
+            yield f"\n{error_messages[error_index]}"
+            logger.debug(f"Detailed error: {str(e)}")
+
+        # Log the interaction
+        self.interactions.append({
+            "interaction_id": interaction_id,
+            "timestamp": datetime.now().isoformat(),
+            "client_email": self.client_email,
+            "chatbot_id": self.chatbot_id,
+            "query": query,
+            "answer": answer,
+            "source_docs": [],
+            "relevance_score": relevance_score,
+        })
 
     def add_feedback(self, interaction_id, score, helpful):
         interaction = next((i for i in self.interactions if i["interaction_id"] == interaction_id), None)
@@ -375,15 +675,12 @@ class SimpleRAGSystem:
     def get_system_stats(self, client_email=None, chatbot_id=None):
         if client_email:
             if chatbot_id:
-                # Stats for specific chatbot
                 inters = [i for i in self.interactions if i.get("client_email") == client_email and i.get("chatbot_id") == chatbot_id]
                 feeds = [f for f in self.feedback_store if f.get("client_email") == client_email and f.get("chatbot_id") == chatbot_id]
             else:
-                # Stats for all client's chatbots
                 inters = [i for i in self.interactions if i.get("client_email") == client_email]
                 feeds = [f for f in self.feedback_store if f.get("client_email") == client_email]
         else:
-            # All stats
             inters = self.interactions
             feeds = self.feedback_store
 
@@ -404,7 +701,6 @@ class SimpleRAGSystem:
         }
 
 # Global RAG system cache
-# Structure: {client_email: {chatbot_id: rag_system}}
 _rag_systems = {}
 _rag_lock = Lock()
 

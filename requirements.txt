@@ -71,7 +71,7 @@ jsonpointer==3.0.0
 kubernetes==32.0.1
 langchain==0.3.25
 langchain-chroma==0.2.3
-langchain-community==0.3.23
+langchain-community==0.3.24
 langchain-core==0.3.59
 langchain-google-genai==2.1.4
 langchain-text-splitters==0.3.8
@@ -131,6 +131,7 @@ pypdf==5.4.0
 PyPika==0.48.9
 pyproject_hooks==1.2.0
 python-dateutil==2.9.0.post0
+python-docx==1.1.2
 python-dotenv==1.1.0
 python-iso639==2025.2.18
 python-magic==0.4.27
