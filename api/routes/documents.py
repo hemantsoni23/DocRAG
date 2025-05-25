@@ -1,10 +1,11 @@
 import logging
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
 from typing import List
 from pydantic import EmailStr
 
 from models.schema import DocumentResponse
 from services.file_service import process_files, split_into_chunks
+from rate_limiter import limiter
 
 from utils.vectorStore import (
     get_vectorstore, update_vectorstore, delete_document, _load_metadata
@@ -32,7 +33,9 @@ def change_num_of_documents(chatbot_id: str, num: int):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.post("", response_model=dict)
+@limiter.limit("5/minute")
 async def add_documents(
+    request:Request,
     background_tasks: BackgroundTasks,
     chatbot_id: str = Form(...),
     client_email: EmailStr = Form(...),
@@ -63,7 +66,8 @@ async def add_documents(
     return {"status": "success", "message": status}
 
 @router.get("", response_model=List[DocumentResponse])
-async def list_documents(chatbot_id: str, client_email: EmailStr):
+@limiter.limit("10/minute")
+async def list_documents(request:Request, chatbot_id: str, client_email: EmailStr):
     """List all documents in a chatbot."""
     if not get_vectorstore(client_email, chatbot_id):
         raise HTTPException(status_code=404, detail=f"Chatbot ID {chatbot_id} not found")
@@ -90,7 +94,8 @@ async def list_documents(chatbot_id: str, client_email: EmailStr):
     return [{"id": info["id"], "name": info["name"]} for info in unique_docs.values()]
 
 @router.delete("/{document_name}", response_model=dict)
-async def remove_document(chatbot_id: str, document_name: str, client_email: EmailStr):
+@limiter.limit("5/minute")
+async def remove_document(request:Request, chatbot_id: str, document_name: str, client_email: EmailStr):
     """Delete a document from a chatbot."""
     if not get_vectorstore(client_email, chatbot_id):
         raise HTTPException(status_code=404, detail=f"Chatbot ID {chatbot_id} not found")

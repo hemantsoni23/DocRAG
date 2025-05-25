@@ -9,6 +9,7 @@ from typing import AsyncGenerator, List, Optional
 from utils.vectorStore import get_vectorstore
 from utils.rag import get_rag_system
 import asyncio
+from rate_limiter import limiter
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -69,11 +70,12 @@ async def stream_chat_with_bot(request: ChatRequest):
     )
 
 @router.post("/chat", response_model=dict)
-async def chat_with_bot(request: ChatRequest):
+@limiter.limit("5/minute")
+async def chat_with_bot(request: Request, chat_request: ChatRequest):
     """Send a message to chat with a specific chatbot."""
-    client_email = request.client_email
-    chatbot_id = request.chatbot_id
-    message = request.message
+    client_email = chat_request.client_email
+    chatbot_id = chat_request.chatbot_id
+    message = chat_request.message
     
     if not message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
@@ -85,10 +87,10 @@ async def chat_with_bot(request: ChatRequest):
         rag_system = get_rag_system(client_email, chatbot_id)
         
         formatted_history = []
-        for i in range(0, len(request.history) - 1, 2):
-            if i + 1 < len(request.history):
-                if request.history[i].role == "user" and request.history[i + 1].role == "assistant":
-                    formatted_history.append((request.history[i].content, request.history[i + 1].content))
+        for i in range(0, len(chat_request.history) - 1, 2):
+            if i + 1 < len(chat_request.history):
+                if chat_request.history[i].role == "user" and chat_request.history[i + 1].role == "assistant":
+                    formatted_history.append((chat_request.history[i].content, chat_request.history[i + 1].content))
         
         result = rag_system.get_answer(
             message, 
@@ -105,7 +107,7 @@ async def chat_with_bot(request: ChatRequest):
             question=message,
             answer=result["answer"],
             interaction_id=result.get("interaction_id"),
-            history=request.history
+            history=chat_request.history
         )
         asyncio.create_task(insert_chat_log(log_data))
 
@@ -122,7 +124,9 @@ async def insert_chat_log(log_data: ChatLog):
     await chat_logs_collection.insert_one(log_data.model_dump())
 
 @router.get("/chat-logs", response_model=List[ChatLog])
+@limiter.limit("20/minute")
 async def get_chat_logs(
+    request: Request,
     client_email: Optional[str] = Query(None),
     chatbot_id: Optional[str] = Query(None),
     limit: int = Query(10, ge=1, le=100),
@@ -145,6 +149,7 @@ async def get_chat_logs(
         raise HTTPException(status_code=500, detail="Error retrieving chat logs")
     
 @router.put("/chat-logs", response_model=dict)
+@limiter.limit("5/minute")
 async def update_chat_log(request: UpdateChatLogs):
     """Update a specific chat log entry."""
     try:
@@ -164,6 +169,7 @@ async def update_chat_log(request: UpdateChatLogs):
         raise HTTPException(status_code=500, detail=f"Error updating chat log: {str(e)}")
 
 @router.post("/feedback", response_model=dict)
+@limiter.limit("10/minute")
 async def submit_feedback(request: FeedbackRequest):
     """Submit feedback for a chat interaction."""
     if not request.interaction_id:

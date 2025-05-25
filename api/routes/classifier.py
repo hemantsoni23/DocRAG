@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
-from google.genai import types
+from rate_limiter import limiter
 import json
 import os
 from google import genai
@@ -328,6 +328,7 @@ def manual_parse_response(response_text: str, user_data: Dict[str, Any]) -> Priv
     )
 
 @router.post("/privacy-classifier", response_model=PrivacyClassificationResponse)
+@limiter.limit("5/minute")
 async def privacy_classifier_endpoint(request: PrivacyClassificationRequest = Body(...)):
     try:
         logger.info(f"Received privacy classification request with {len(request.user_data)} fields")

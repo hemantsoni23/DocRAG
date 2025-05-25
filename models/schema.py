@@ -59,3 +59,42 @@ class ChatLog(BaseModel):
 class UpdateChatLogs(BaseModel):
     interaction_id: Optional[str]
     answer: str
+
+class CrawlRequest(BaseModel):
+    start_url: str
+    max_pages: int = 100
+    concurrency: int = 10
+    max_depth: Optional[int] = None
+    output_formats: List[str] = ["json", "txt", "csv"]
+    debug_mode: bool = False
+
+class CrawlResponse(BaseModel):
+    job_id: str
+    status: str
+    start_url: str
+    start_time: str
+    message: str
+
+class JobStatus(BaseModel):
+    job_id: str
+    status: str
+    start_url: str
+    start_time: str
+    end_time: Optional[str] = None
+    pages_crawled: int = 0
+    error: Optional[str] = None
+    output_files: Dict[str, str] = {}
+    debug_stats: Dict[str, Any] = {}
+
+# Enhanced chatbot creation schema
+class ChatbotCreateRequest(BaseModel):
+    name: str
+    client_email: EmailStr
+    urls: Optional[List[str]] = None
+    
+class ChatbotCreateResponse(BaseModel):
+    status: str
+    message: str
+    chatbot_id: str
+    chatbot_name: str
+    crawl_job_id: Optional[str] = None

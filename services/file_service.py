@@ -8,6 +8,7 @@ from typing import List, Tuple, Callable
 
 from utils.loader import load_document
 from utils.text_processor import split_documents
+from langchain_core.documents import Document
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -74,8 +75,24 @@ async def process_files(files: List[UploadFile]) -> Tuple[list, int, int, Callab
 def split_into_chunks(docs):
     """Split documents into chunks for vectorstore."""
     all_chunks = []
+
     for doc in docs:
-        file_name = doc.metadata.get("source", "unknown_file")
-        doc_chunks = split_documents([doc], file_name)
-        all_chunks.extend(doc_chunks)
+        print(f"Here 2 >> Processing document: {doc}")
+        try:
+            # Convert dict to LangChain Document if needed
+            if isinstance(doc, dict):
+                document = Document(page_content=doc["content"], metadata=doc.get("metadata", {}))
+            else:
+                document = doc  # already a Document instance
+
+            file_name = document.metadata.get("source", "unknown_file")
+
+            # Call your custom split_documents function
+            doc_chunks = split_documents([document], file_name)
+            all_chunks.extend(doc_chunks)
+
+        except Exception as e:
+            print(f"❌ Error processing document: {e}")
+            logging.error(f"❌ Failed to split documents: {e}")
+
     return all_chunks
