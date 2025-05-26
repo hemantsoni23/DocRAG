@@ -191,6 +191,85 @@ async def create_chatbot(
             status_code=500,
             detail=f"Error creating chatbot: {str(e)}"
         )
+    
+@router.post("/urls", response_model=ChatbotCreateResponse)
+@limiter.limit("5/minute")
+async def create_chatbot_url(
+    request: Request,
+    name: str = Form(...),
+    client_email: EmailStr = Form(...),
+    urls: Optional[str] = Form(None),
+    max_pages_per_url: int = Form(50)
+):
+    """Create a new chatbot with uploaded documents and/or crawled URLs."""
+    
+    # Parse URLs if provided
+    url_list = [url.strip() for url in urls.split(',')] if urls else []
+
+    # Validation: Require at least one valid source
+    if not url_list:
+        raise HTTPException(
+            status_code=400,
+            detail="URLs must be provided"
+        )
+
+    chatbot_name = name or f"Chatbot {uuid.uuid4().hex[:6]}"
+    chatbot_id = f"cb_{uuid.uuid4().hex[:10]}"
+    
+    all_docs = []
+    crawl_job_id = None
+
+    try:
+        # Process URLs by crawling
+        if url_list:
+            logger.info(f"Processing {len(url_list)} URLs for crawling")
+            crawled_docs = await process_urls_for_chatbot(url_list, max_pages_per_url)
+            all_docs.extend(crawled_docs)
+            logger.info(f"Crawled content from {len(crawled_docs)} pages")
+
+        # Validate extracted content
+        if not all_docs:
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to extract any content from URLs"
+            )
+
+        # Vectorstore creation
+        logger.info(f"Creating vector store with {len(all_docs)} documents")
+        all_chunks = split_into_chunks(all_docs)
+        create_vectorstore(all_chunks, client_email, chatbot_id, chatbot_name)
+
+        # Setup RAG pipeline
+        rag_system = get_rag_system(client_email, chatbot_id)
+        rag_system.initialize_retriever(client_email, chatbot_id)
+        rag_system.setup_rag_chain()
+
+        # Build response message
+        status_parts = []
+        if url_list:
+            status_parts.append(f"{len(url_list)} URLs crawled")
+
+        status = f"Created chatbot '{chatbot_name}' ({', '.join(status_parts)}, {len(all_chunks)} chunks)"
+
+        # Cleanup crawler output
+        OUTPUT_DIR = "crawler_output"
+        shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+
+        logger.info(f"Chatbot created successfully: {chatbot_name} ({chatbot_id})")
+        return ChatbotCreateResponse(
+            status="success",
+            message=status,
+            chatbot_id=chatbot_id,
+            chatbot_name=chatbot_name,
+            crawl_job_id=crawl_job_id
+        )
+
+    except Exception as e:
+        logger.error(f"Error creating chatbot: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error creating chatbot: {str(e)}"
+        )
 
 # Additional crawler-related endpoints for the main backend
 @router.get("/crawl-jobs/{job_id}")

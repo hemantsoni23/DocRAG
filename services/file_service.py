@@ -77,7 +77,6 @@ def split_into_chunks(docs):
     all_chunks = []
 
     for doc in docs:
-        print(f"Here 2 >> Processing document: {doc}")
         try:
             # Convert dict to LangChain Document if needed
             if isinstance(doc, dict):
