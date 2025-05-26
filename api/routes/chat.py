@@ -150,11 +150,11 @@ async def get_chat_logs(
     
 @router.put("/chat-logs", response_model=dict)
 @limiter.limit("5/minute")
-async def update_chat_log(request: UpdateChatLogs):
+async def update_chat_log(request:Request,update_req: UpdateChatLogs):
     """Update a specific chat log entry."""
     try:
-        interaction_id = request.interaction_id
-        answer = request.answer
+        interaction_id = update_req.interaction_id
+        answer = update_req.answer
         result = await chat_logs_collection.update_one(
             {"interaction_id": interaction_id},
             {"$set": {
@@ -170,20 +170,20 @@ async def update_chat_log(request: UpdateChatLogs):
 
 @router.post("/feedback", response_model=dict)
 @limiter.limit("10/minute")
-async def submit_feedback(request: FeedbackRequest):
+async def submit_feedback(request:Request, feedback_req: FeedbackRequest):
     """Submit feedback for a chat interaction."""
-    if not request.interaction_id:
+    if not feedback_req.interaction_id:
         raise HTTPException(status_code=400, detail="Missing interaction ID")
-    print(request.interaction_id, request.score, request.helpful, request.client_email, request.chatbot_id)
+    print(feedback_req.interaction_id, feedback_req.score, feedback_req.helpful, feedback_req.client_email, feedback_req.chatbot_id)
     try:
-        rag_system = get_rag_system(request.client_email, request.chatbot_id)
-        success = rag_system.add_feedback(request.interaction_id, request.score, request.helpful)
+        rag_system = get_rag_system(feedback_req.client_email, feedback_req.chatbot_id)
+        success = rag_system.add_feedback(feedback_req.interaction_id, feedback_req.score, feedback_req.helpful)
         
         if not success:
             raise HTTPException(status_code=500, detail="Failed to record feedback")
         
         # Insert feedback into MongoDB
-        feedback_data = request.model_dump()
+        feedback_data = feedback_req.model_dump()
         await feedback_collection.insert_one(feedback_data)
         
         return {"status": "success", "message": "Feedback submitted successfully"}

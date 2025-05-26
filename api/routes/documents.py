@@ -1,6 +1,6 @@
 import logging
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks, Request
-from typing import List
+from typing import List,Optional
 from pydantic import EmailStr
 
 from models.schema import DocumentResponse
@@ -11,6 +11,7 @@ from utils.vectorStore import (
     get_vectorstore, update_vectorstore, delete_document, _load_metadata
 )
 from database import agents_collection
+from utils.process_urls import process_urls_for_chatbot
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -62,6 +63,48 @@ async def add_documents(
         status += f". {failed} file(s) failed."
 
     change_num_of_documents(chatbot_id, len(files))
+
+    return {"status": "success", "message": status}
+
+@router.post("/url", response_model=dict)
+@limiter.limit("5/minute")
+async def add_url_documents(
+    request:Request,
+    chatbot_id: str = Form(...),
+    client_email: EmailStr = Form(...),
+    urls: Optional[str] = Form(None),
+    max_pages_per_url: int = Form(50)
+):
+    """Add url documents to an existing chatbot."""
+    url_list = [url.strip() for url in urls.split(',')] if urls else []
+
+    if not url_list:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    
+    if not get_vectorstore(client_email, chatbot_id):
+        raise HTTPException(status_code=404, detail=f"Chatbot ID {chatbot_id} not found")
+    
+    all_docs = []
+    crawled_docs = await process_urls_for_chatbot(url_list, max_pages_per_url)
+    processed = len(crawled_docs)
+    failed = 0
+    for doc in crawled_docs:
+        if doc:
+            all_docs.append(doc)
+        else:
+            failed += 1
+    
+    if not all_docs:
+        raise HTTPException(status_code=400, detail="Failed to extract any content from files")
+    
+    all_chunks = split_into_chunks(all_docs)
+    update_vectorstore(all_chunks, client_email, chatbot_id)
+    
+    status = f"Added {processed} files to chatbot"
+    if failed:
+        status += f". {failed} file(s) failed."
+
+    change_num_of_documents(chatbot_id, len(url_list))
 
     return {"status": "success", "message": status}
 
