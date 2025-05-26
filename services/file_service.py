@@ -9,6 +9,7 @@ from typing import List, Tuple, Callable
 from utils.loader import load_document
 from utils.text_processor import split_documents
 from langchain_core.documents import Document
+import urllib.parse
 
 # Set up logging
 logger = logging.getLogger(__name__)

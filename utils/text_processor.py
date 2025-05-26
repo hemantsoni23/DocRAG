@@ -25,7 +25,7 @@ def split_documents(docs: List[Document], file_name: str, chunk_size: int = 1000
     try:
         # Generate a source document ID for all chunks from this file
         source_id = str(uuid.uuid4())
-        source_name = os.path.basename(file_name)
+        source_name = file_name
         
         # Configure the text splitter
         text_splitter = RecursiveCharacterTextSplitter(

@@ -68,6 +68,7 @@ async def process_urls_for_chatbot(urls: List[str], max_pages_per_url: int = 50)
                     "content": combined_content.strip(),
                     "metadata": {
                         "source": url,
+                        "source_name": f"url_{url}",
                         "title": titles[0] if titles else "Untitled",
                         "type": "web_crawl"
                     }
@@ -171,8 +172,8 @@ async def create_chatbot(
             status += f". {failed_files} file(s) failed."
 
         # Cleanup crawler output
-        OUTPUT_DIR = "crawler_output"
-        shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+        # OUTPUT_DIR = "crawler_output"
+        # shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
 
         logger.info(f"Chatbot created successfully: {chatbot_name} ({chatbot_id})")
         return ChatbotCreateResponse(
@@ -252,8 +253,8 @@ async def create_chatbot_url(
         status = f"Created chatbot '{chatbot_name}' ({', '.join(status_parts)}, {len(all_chunks)} chunks)"
 
         # Cleanup crawler output
-        OUTPUT_DIR = "crawler_output"
-        shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+        # OUTPUT_DIR = "crawler_output"
+        # shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
 
         logger.info(f"Chatbot created successfully: {chatbot_name} ({chatbot_id})")
         return ChatbotCreateResponse(
